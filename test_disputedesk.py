@@ -24,3 +24,8 @@ def test_unhandled_reason_falls_back_to_needs_review():
     tx = Transaction("T4", 800, date(2026, 8, 15), delivered=True, delivery_address_matches_billing=True)
     d = Dispute("D4", "T4", "product_unacceptable")
     assert recommend_action(d, tx) == "needs_review — unhandled reason code"
+
+def test_product_unacceptable_always_needs_review():
+    tx = Transaction("T5", 800, date(2026, 8, 15), delivered=True, delivery_address_matches_billing=True)
+    d = Dispute("D5", "T5", "product_unacceptable")
+    assert recommend_action(d, tx) == "needs_review — unhandled reason code"

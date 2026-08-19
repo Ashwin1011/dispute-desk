@@ -41,12 +41,14 @@ transactions = [
     Transaction("T1", 2499, date(2026, 8, 5), delivered=True, delivery_address_matches_billing=True),
     Transaction("T2", 1200, date(2026, 8, 10), delivered=False, delivery_address_matches_billing=False),
     Transaction("T3", 50, date(2026, 8, 12), delivered=True, delivery_address_matches_billing=True),
-]
+    Transaction("T4", 800, date(2026, 8, 15), delivered=True, delivery_address_matches_billing=True),
+    ]
 
 disputes = [
     Dispute("D1", "T1", "unrecognized"),      # this is Priya's case
     Dispute("D2", "T2", "product_not_received"),
     Dispute("D3", "T3", "duplicate"),
+    Dispute("D4", "T4", "product_unacceptable"),
 ]
 
 
