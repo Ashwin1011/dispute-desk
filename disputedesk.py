@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 from dataclasses import dataclass
 from datetime import date
+from typing import Literal
+from pydantic import BaseModel
 
 
 @dataclass
@@ -12,11 +14,10 @@ class Transaction:
     delivery_address_matches_billing: bool
 
 
-@dataclass
-class Dispute:
+class Dispute(BaseModel):
     id: str
     transaction_id: str
-    reason: str  # "unrecognized", "product_not_received", "duplicate", "product_unacceptable"
+    reason: Literal["unrecognized", "product_not_received", "duplicate", "product_unacceptable"]
 
 
 def recommend_action(dispute: Dispute, transaction: Transaction) -> str:
@@ -45,10 +46,10 @@ transactions = [
     ]
 
 disputes = [
-    Dispute("D1", "T1", "unrecognized"),      # this is Priya's case
-    Dispute("D2", "T2", "product_not_received"),
-    Dispute("D3", "T3", "duplicate"),
-    Dispute("D4", "T4", "product_unacceptable"),
+    Dispute(id="D1", transaction_id="T1", reason="unrecognized"),      # this is Priya's case
+    Dispute(id="D2", transaction_id="T2", reason="product_not_received"),
+    Dispute(id="D3", transaction_id="T3", reason="duplicate"),
+    Dispute(id="D4", transaction_id="T4", reason="product_unacceptable"),
 ]
 
 
