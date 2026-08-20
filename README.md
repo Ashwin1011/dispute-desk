@@ -1,15 +1,18 @@
 # DisputeDesk
 
-A payment-dispute / chargeback copilot. It classifies a customer’s complaint into a Stripe/Razorpay-style reason code, then (separately) recommends contest / accept / review from synthetic order records.
+A payment-dispute / chargeback copilot. It classifies a customer’s complaint into a Stripe/Razorpay-style reason code, retrieves the evidence on file for that transaction, and drafts a reply that cites it.
 
-**Current milestone: v2.** A FastAPI endpoint sends the customer message to Claude, then Pydantic validates the JSON into a structured classification.
+**Current milestone: v3.5.** Simple RAG: given a transaction ID, grab every evidence snippet for that ID and pass it to Claude with the customer message. No embeddings — lookup by ID.
 
 ## What it does
 
-Two pieces sit side by side:
+Three pieces sit side by side:
 
-1. **Classify** (v2) — free-text customer message → Claude → `DraftClassification` (`reason`, `confidence`, `explanation`).
-2. **Recommend** (v1) — a known `Dispute` + `Transaction` → a rules-based action string.
+1. **Recommend** (v1) — a known `Dispute` + `Transaction` → a rules-based action string.
+2. **Classify** (v2) — free-text customer message → Claude → `DraftClassification` (`reason`, `confidence`, `explanation`).
+3. **Retrieve + draft** (v3.5) — customer message + transaction ID → `retrieve_evidence(id)` → Claude → `DraftResponse` (`reason`, `evidence_cited`, `draft_text`, `confidence`).
+
+`retrieve_evidence` is the RAG step: filter the in-memory `evidence_items` list for that `transaction_id` and return all matching texts. If nothing matches, the prompt says “No evidence on file.”
 
 Reason codes:
 
@@ -31,7 +34,7 @@ Action rules (`recommend_action`):
 | `unrecognized` | No delivery evidence | needs_review |
 | `product_unacceptable` | — | needs_review (not handled yet) |
 
-Records live in in-memory lists in `disputedesk.py` (T1–T4 / D1–D4), standing in for a real orders database.
+Records live in in-memory lists in `disputedesk.py` (T1–T4 / D1–D4, plus evidence for T1–T3), standing in for a real orders database.
 
 ## Setup
 
@@ -52,11 +55,13 @@ ANTHROPIC_API_KEY=your_key_here
 
 ## Run
 
-**CLI classifier** — classifies a sample customer message and prints the structured result:
+**CLI draft** — retrieves evidence for a transaction ID and prints a structured `DraftResponse`:
 
 ```bash
 python disputedesk.py
 ```
+
+Current sample in `main()`: a duplicate-charge complaint against `T3`.
 
 **API** — FastAPI app, reload on save:
 
@@ -100,7 +105,7 @@ pytest -v
 
 | File | Role |
 |---|---|
-| `disputedesk.py` | Models, action rules, Claude classifier, FastAPI `/classify` |
+| `disputedesk.py` | Models, action rules, evidence store, retrieve + draft, classifier, FastAPI `/classify` |
 | `anthropic_api_call.py` | Anthropic client (reads `ANTHROPIC_API_KEY` from `.env`) |
 | `test_disputedesk.py` | Pytest coverage for `recommend_action` |
 | `conftest.py` | Fails fast if pytest is run on Python &lt; 3.11 |
@@ -116,3 +121,7 @@ pytest -v
 **v1.1** — `Dispute.reason` is a Pydantic `Literal`, so invalid reason codes fail at construction.
 
 **v2** — Claude classifies a customer message; Pydantic (`DraftClassification`) validates the model JSON; FastAPI + uvicorn expose `POST /classify`.
+
+**v3** — `DraftResponse`: classify the dispute and draft a short customer-facing reply. Markdown fences around Claude’s JSON are stripped before Pydantic validation.
+
+**v3.5** — Simple RAG: `retrieve_evidence(transaction_id)` grabs every `EvidenceItem` for that ID (no embeddings) and injects it into the draft prompt so the reply can cite tracking / order-history text on file.
