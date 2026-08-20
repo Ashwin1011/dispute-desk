@@ -3,7 +3,16 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Literal
 from pydantic import BaseModel
+from sentence_transformers import SentenceTransformer
+import psycopg2
+from pgvector.psycopg2 import register_vector
 
+embedder = SentenceTransformer("all-MiniLM-L6-v2")
+
+conn = psycopg2.connect(
+    host="localhost", port=5432, dbname="postgres", user="postgres", password="devpassword"
+)
+register_vector(conn)  # teaches psycopg2 how to send Python vectors to Postgres's vector column
 
 def parse_model_json(text: str) -> str:
     """Claude often wraps JSON in ```json fences; Pydantic needs the raw object."""
@@ -47,6 +56,22 @@ class DraftResponse(BaseModel):
 def retrieve_evidence(transaction_id: str) -> list[str]:
     return [item.text for item in evidence_items if item.transaction_id == transaction_id]
 
+cur = conn.cursor()
+
+def retrieve_evidence_semantic(query_text: str, top_k: int = 2) -> list[str]:
+    query_vector = embedder.encode(query_text)
+    cur.execute(
+        """
+        SELECT text, embedding <=> %s AS distance
+        FROM evidence
+        ORDER BY distance
+        LIMIT %s
+        """,
+        (query_vector, top_k),
+    )
+    rows = cur.fetchall()
+    print(rows)
+    return [text for text, _ in rows]
 
 def draft_response(customer_message: str, transaction_id: str) -> DraftResponse:
     evidence = retrieve_evidence(transaction_id)
@@ -146,7 +171,19 @@ def main():
     #     action = recommend_action(d, tx)
     #     print(f"{d.id} (reason: {d.reason}) on {tx.id} (₹{tx.amount}) -> {action}")
 
-    print(draft_response("Duplicate charge on my card, I never ordered anything.", "T3"))
+    # print(draft_response("Duplicate charge on my card, I never ordered anything.", "T3"))
+
+
+    # for item in evidence_items:
+    #     vector = embedder.encode(item.text)
+    #     cur.execute(
+    #         "INSERT INTO evidence (transaction_id, text, embedding) VALUES (%s, %s, %s)",
+    #         (item.transaction_id, item.text, vector),
+    #     )
+    # conn.commit()
+
+    print(retrieve_evidence_semantic("the customer says their package never arrived"))
+
 
 
 if __name__ == "__main__":
