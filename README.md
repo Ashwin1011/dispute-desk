@@ -1,18 +1,21 @@
 # DisputeDesk
 
-A payment-dispute / chargeback copilot. It classifies a customer’s complaint into a Stripe/Razorpay-style reason code, retrieves the evidence on file for that transaction, and drafts a reply that cites it.
+A payment-dispute / chargeback copilot. It classifies a customer’s complaint into a Stripe/Razorpay-style reason code, retrieves evidence, and drafts a reply that cites it.
 
-**Current milestone: v3.5.** Simple RAG: given a transaction ID, grab every evidence snippet for that ID and pass it to Claude with the customer message. No embeddings — lookup by ID.
+**Current milestone: v4.** Semantic RAG: embed the customer message with `all-MiniLM-L6-v2`, then nearest-neighbor search in Postgres (`pgvector`) for the closest evidence snippets. The older ID lookup (`retrieve_evidence`) is still in the file.
 
 ## What it does
 
-Three pieces sit side by side:
+Four pieces sit side by side:
 
 1. **Recommend** (v1) — a known `Dispute` + `Transaction` → a rules-based action string.
 2. **Classify** (v2) — free-text customer message → Claude → `DraftClassification` (`reason`, `confidence`, `explanation`).
-3. **Retrieve + draft** (v3.5) — customer message + transaction ID → `retrieve_evidence(id)` → Claude → `DraftResponse` (`reason`, `evidence_cited`, `draft_text`, `confidence`).
+3. **ID retrieve + draft** (v3.5) — customer message + transaction ID → `retrieve_evidence(id)` → Claude → `DraftResponse`.
+4. **Semantic retrieve** (v4) — customer message → `retrieve_evidence_semantic(query)` → top-k evidence texts by cosine distance (`<=>`).
 
-`retrieve_evidence` is the RAG step: filter the in-memory `evidence_items` list for that `transaction_id` and return all matching texts. If nothing matches, the prompt says “No evidence on file.”
+`retrieve_evidence` filters the in-memory `evidence_items` list by `transaction_id`.
+
+`retrieve_evidence_semantic` encodes the query, runs `ORDER BY embedding <=> query_vector LIMIT top_k` (default `top_k=2`) against a Postgres `evidence` table, and returns the matching texts.
 
 Reason codes:
 
@@ -34,11 +37,11 @@ Action rules (`recommend_action`):
 | `unrecognized` | No delivery evidence | needs_review |
 | `product_unacceptable` | — | needs_review (not handled yet) |
 
-Records live in in-memory lists in `disputedesk.py` (T1–T4 / D1–D4, plus evidence for T1–T3), standing in for a real orders database.
+In-memory records in `disputedesk.py` (T1–T4 / D1–D4, evidence for T1–T3) still stand in for orders. Embeddings for those snippets live in Postgres once seeded (the seed `INSERT` loop is commented in `main()`).
 
 ## Setup
 
-Python **3.11+**. The repo pins `3.11.9` in `.python-version` so pyenv does not pick up a global Python 2 install.
+Python **3.11+**. The repo pins `3.11.9` in `.python-version`.
 
 ```bash
 python3 -m venv .venv
@@ -47,29 +50,47 @@ pip install -e ".[dev]"
 pip install fastapi uvicorn pydantic anthropic python-dotenv
 ```
 
+`pyproject.toml` already pulls in `sentence-transformers`, `psycopg2-binary`, and `pgvector`.
+
 Create a `.env` in the project root (do not commit it):
 
 ```
 ANTHROPIC_API_KEY=your_key_here
 ```
 
+**Postgres + pgvector** must be running locally. The app connects as:
+
+```
+host=localhost port=5432 dbname=postgres user=postgres password=devpassword
+```
+
+`all-MiniLM-L6-v2` embeddings are 384-dimensional. The `evidence` table needs a `vector` column of that size, for example:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE IF NOT EXISTS evidence (
+    transaction_id text,
+    text text,
+    embedding vector(384)
+);
+```
+
+Uncomment the seed loop in `main()` once to insert the in-memory `evidence_items` rows, then comment it again so you do not duplicate them on every run.
+
 ## Run
 
-**CLI draft** — retrieves evidence for a transaction ID and prints a structured `DraftResponse`:
+**CLI** — current `main()` prints semantic matches for a “package never arrived” query:
 
 ```bash
 python disputedesk.py
 ```
-
-Current sample in `main()`: a duplicate-charge complaint against `T3`.
 
 **API** — FastAPI app, reload on save:
 
 ```bash
 uvicorn disputedesk:app --reload
 ```
-
-Then:
 
 ```bash
 curl -X POST http://127.0.0.1:8000/classify \
@@ -95,7 +116,7 @@ Response:
 }
 ```
 
-**Tests** (rules engine only — they do not call Claude):
+**Tests** (rules engine only — they do not call Claude or Postgres):
 
 ```bash
 pytest -v
@@ -105,7 +126,7 @@ pytest -v
 
 | File | Role |
 |---|---|
-| `disputedesk.py` | Models, action rules, evidence store, retrieve + draft, classifier, FastAPI `/classify` |
+| `disputedesk.py` | Models, action rules, ID retrieve, semantic retrieve (pgvector), classifier, FastAPI `/classify` |
 | `anthropic_api_call.py` | Anthropic client (reads `ANTHROPIC_API_KEY` from `.env`) |
 | `test_disputedesk.py` | Pytest coverage for `recommend_action` |
 | `conftest.py` | Fails fast if pytest is run on Python &lt; 3.11 |
@@ -122,6 +143,8 @@ pytest -v
 
 **v2** — Claude classifies a customer message; Pydantic (`DraftClassification`) validates the model JSON; FastAPI + uvicorn expose `POST /classify`.
 
-**v3** — `DraftResponse`: classify the dispute and draft a short customer-facing reply. Markdown fences around Claude’s JSON are stripped before Pydantic validation.
+**v2.5** — `DraftResponse`: classify the dispute and draft a short customer-facing reply. Markdown fences around Claude’s JSON are stripped before Pydantic validation.
 
-**v3.5** — Simple RAG: `retrieve_evidence(transaction_id)` grabs every `EvidenceItem` for that ID (no embeddings) and injects it into the draft prompt so the reply can cite tracking / order-history text on file.
+**v3** — Simple RAG: `retrieve_evidence(transaction_id)` grabs every `EvidenceItem` for that ID (no embeddings) and injects it into the draft prompt.
+
+**v3.5** — Semantic RAG: `SentenceTransformer("all-MiniLM-L6-v2")` + Postgres `pgvector`. `retrieve_evidence_semantic` returns the top-k nearest evidence texts by cosine distance.
