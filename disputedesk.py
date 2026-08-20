@@ -6,6 +6,9 @@ from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 import psycopg2
 from pgvector.psycopg2 import register_vector
+from anthropic_api_call import client
+from fastapi import FastAPI
+app = FastAPI()
 
 embedder = SentenceTransformer("all-MiniLM-L6-v2")
 
@@ -23,9 +26,7 @@ def parse_model_json(text: str) -> str:
             text = text[: text.rfind("```")]
         text = text.strip()
     return text
-from anthropic_api_call import client
-from fastapi import FastAPI
-app = FastAPI()
+
 
 class DraftClassification(BaseModel):
     reason: Literal["unrecognized", "product_not_received", "duplicate", "product_unacceptable"]
@@ -58,23 +59,23 @@ def retrieve_evidence(transaction_id: str) -> list[str]:
 
 cur = conn.cursor()
 
-def retrieve_evidence_semantic(query_text: str, top_k: int = 2) -> list[str]:
+def retrieve_evidence_semantic(query_text: str, transaction_id: str, top_k: int = 2) -> list[str]:
     query_vector = embedder.encode(query_text)
     cur.execute(
         """
         SELECT text, embedding <=> %s AS distance
         FROM evidence
+        WHERE transaction_id = %s
         ORDER BY distance
         LIMIT %s
         """,
-        (query_vector, top_k),
+        (query_vector, transaction_id, top_k),
     )
     rows = cur.fetchall()
-    print(rows)
-    return [text for text, _ in rows]
+    return [text for text, distance in rows]
 
 def draft_response(customer_message: str, transaction_id: str) -> DraftResponse:
-    evidence = retrieve_evidence(transaction_id)
+    evidence = retrieve_evidence_semantic(customer_message, transaction_id, top_k=2)
     evidence_block = "\n".join(f"- {e}" for e in evidence) or "No evidence on file."
 
     prompt = f"""A customer wrote this dispute message:
@@ -83,7 +84,7 @@ def draft_response(customer_message: str, transaction_id: str) -> DraftResponse:
 Here is the evidence on file for this transaction:
 {evidence_block}
 
-Classify it into exactly one of: unrecognized, product_not_received, duplicate, product_unacceptable. Draft a short response citing the specific evidence above,
+Classify it into exactly one of: unrecognized, product_not_received, duplicate, product_unacceptable, draft a short response citing the specific evidence above,
 and rate your confidence. Respond with ONLY valid JSON matching this shape:
 {{"reason": "...", "evidence_cited": ["..."], "draft_text": "...", "confidence": 0.0}}"""
 
@@ -171,7 +172,7 @@ def main():
     #     action = recommend_action(d, tx)
     #     print(f"{d.id} (reason: {d.reason}) on {tx.id} (₹{tx.amount}) -> {action}")
 
-    # print(draft_response("Duplicate charge on my card, I never ordered anything.", "T3"))
+    print(draft_response("I don't recognize this charge on my card, I never ordered anything.", "T1"))
 
 
     # for item in evidence_items:
@@ -182,7 +183,7 @@ def main():
     #     )
     # conn.commit()
 
-    print(retrieve_evidence_semantic("the customer says their package never arrived"))
+    # print(retrieve_evidence_semantic("the customer says their package never arrived"))
 
 
 

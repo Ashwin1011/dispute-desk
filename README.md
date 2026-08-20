@@ -145,6 +145,9 @@ pytest -v
 
 **v2.5** — `DraftResponse`: classify the dispute and draft a short customer-facing reply. Markdown fences around Claude’s JSON are stripped before Pydantic validation.
 
-**v3** — Simple RAG: `retrieve_evidence(transaction_id)` grabs every `EvidenceItem` for that ID (no embeddings) and injects it into the draft prompt.
+**v2.7** — Simple RAG: `retrieve_evidence(transaction_id)` grabs every `EvidenceItem` for that ID (no embeddings) and injects it into the draft prompt.
 
-**v3.5** — Semantic RAG: `SentenceTransformer("all-MiniLM-L6-v2")` + Postgres `pgvector`. `retrieve_evidence_semantic` returns the top-k nearest evidence texts by cosine distance.
+**v2.8** — Semantic RAG: `SentenceTransformer("all-MiniLM-L6-v2")` + Postgres `pgvector`. `retrieve_evidence_semantic` returns the top-k nearest evidence texts by cosine distance.
+
+**v2.9** — Semantic RAG + Response Drafting: `SentenceTransformer("all-MiniLM-L6-v2")` + Postgres `pgvector`. `retrieve_evidence_semantic` + `DraftResponse` classify the dispute and draft a short customer-facing reply
+
