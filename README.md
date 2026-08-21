@@ -149,5 +149,5 @@ pytest -v
 
 **v2.8** — Semantic RAG: `SentenceTransformer("all-MiniLM-L6-v2")` + Postgres `pgvector`. `retrieve_evidence_semantic` returns the top-k nearest evidence texts by cosine distance.
 
-**v2.9** — Semantic RAG + Response Drafting: `SentenceTransformer("all-MiniLM-L6-v2")` + Postgres `pgvector`. `retrieve_evidence_semantic` + `DraftResponse` classify the dispute and draft a short customer-facing reply
+**v3** — Semantic RAG + Response Drafting: `SentenceTransformer("all-MiniLM-L6-v2")` + Postgres `pgvector`. `retrieve_evidence_semantic` + `DraftResponse` classify the dispute and draft a short customer-facing reply
 
