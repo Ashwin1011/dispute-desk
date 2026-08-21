@@ -2,7 +2,7 @@
 from dataclasses import dataclass
 from datetime import date
 from typing import Literal, TypedDict, Optional
-from langgraph.graph import StateGraph, END
+from langgraph.graph import StateGraph, END, START
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 import psycopg2
@@ -10,6 +10,7 @@ from pgvector.psycopg2 import register_vector
 from anthropic_api_call import client
 from anthropic.types import Message, TextBlock
 from fastapi import FastAPI
+import statistics
 app = FastAPI()
 
 embedder = SentenceTransformer("all-MiniLM-L6-v2")
@@ -48,6 +49,92 @@ class EvidenceItem:
     transaction_id: str
     text: str
 
+# a tiny pretend database, standing in for real records
+transactions = [
+    Transaction("T1", 2499, date(2026, 8, 5), delivered=True, delivery_address_matches_billing=True),
+    Transaction("T2", 1200, date(2026, 8, 10), delivered=False, delivery_address_matches_billing=False),
+    Transaction("T3", 50, date(2026, 8, 12), delivered=True, delivery_address_matches_billing=True),
+    Transaction("T4", 800, date(2026, 8, 15), delivered=True, delivery_address_matches_billing=True),
+    ]
+
+import statistics
+
+class FraudFlag(BaseModel):
+    z_score: float
+    is_anomaly: bool
+    note: str
+
+def check_fraud_signals(transaction_id: str) -> FraudFlag:
+    tx = next((t for t in transactions if t.id == transaction_id), None)
+    if tx is None:
+        return FraudFlag(z_score=0.0, is_anomaly=False, note="transaction not found")
+
+    amounts = [t.amount for t in transactions]
+    mean = statistics.mean(amounts)
+    stdev = statistics.pstdev(amounts) or 1.0  # guard divide-by-zero if all amounts match
+
+    z = (tx.amount - mean) / stdev
+    is_anomaly = abs(z) > 1.5  # arbitrary threshold — tune once you have more than 4 fixture rows
+
+    note = (
+        f"amount ₹{tx.amount} is {abs(z):.2f} std devs from the mean (₹{mean:.2f}) — flagged for review"
+        if is_anomaly
+        else f"amount ₹{tx.amount} is within normal range (z={z:.2f})"
+    )
+    return FraudFlag(z_score=z, is_anomaly=is_anomaly, note=note)
+
+
+class CriticVerdict(BaseModel):
+    grounded: bool
+    escalate_for_review: bool
+    notes: str
+
+class DraftResponse(BaseModel):
+    reason: Literal["unrecognized", "product_not_received", "duplicate", "product_unacceptable"]
+    evidence_cited: list[str]
+    draft_text: str
+    confidence: float
+
+class DisputeState(TypedDict):
+    customer_message: str
+    transaction_id: str
+    evidence: Optional[list[str]]
+    fraud_flag: Optional[FraudFlag]
+    draft: Optional[DraftResponse]
+    critic_verdict: Optional[CriticVerdict]
+
+def _normalize(text: str) -> str:
+    return text.strip().rstrip(".").lower()
+
+def check_grounding(draft: DraftResponse, evidence: list[str]) -> bool:
+    normalized_evidence = [_normalize(e) for e in evidence]
+    return all(
+        any(_normalize(cited) in ev or ev in _normalize(cited) for ev in normalized_evidence)
+        for cited in draft.evidence_cited
+    )
+
+def critic_node(state: DisputeState) -> dict:
+    draft = state["draft"]
+    evidence = state["evidence"]
+    fraud_flag = state["fraud_flag"]
+    assert draft is not None and evidence is not None and fraud_flag is not None
+
+    grounded = check_grounding(draft, evidence)
+    if not grounded:
+        draft = draft_from_evidence(state["customer_message"], evidence)  # retry once
+        grounded = check_grounding(draft, evidence)
+
+    escalate = fraud_flag.is_anomaly or not grounded
+    if fraud_flag.is_anomaly and grounded:
+        notes = "flagged: fraud anomaly on this transaction — needs human review"
+    elif not grounded:
+        notes = "flagged: draft still cites unsupported evidence after retry"
+    else:
+        notes = "passed: grounded, no fraud signal"
+
+    verdict = CriticVerdict(grounded=grounded, escalate_for_review=escalate, notes=notes)
+    return {"draft": draft, "critic_verdict": verdict}
+
 def parse_model_json(text: str) -> str:
     """Claude often wraps JSON in ```json fences; Pydantic needs the raw object."""
     text = text.strip()
@@ -66,11 +153,7 @@ def message_text(message: Message) -> str:
     raise TypeError("Claude response had no text block")
 
 
-class DraftResponse(BaseModel):
-    reason: Literal["unrecognized", "product_not_received", "duplicate", "product_unacceptable"]
-    evidence_cited: list[str]
-    draft_text: str
-    confidence: float
+
 
 # def retrieve_evidence(transaction_id: str) -> list[str]:
 #     return [item.text for item in evidence_items if item.transaction_id == transaction_id]
@@ -109,28 +192,31 @@ and rate your confidence. Respond with ONLY valid JSON matching this shape:
     return DraftResponse.model_validate_json(parse_model_json(message_text(response)))
 
 
-class DisputeState(TypedDict):
-    customer_message: str
-    transaction_id: str
-    evidence: Optional[list[str]]
-    draft: Optional[DraftResponse]
+def fraud_node(state: DisputeState) -> dict:
+    return {"fraud_flag": check_fraud_signals(state["transaction_id"])}
 
-def retrieve_node(state: DisputeState) -> DisputeState:
-    state["evidence"] = retrieve_evidence_semantic(state["customer_message"], state["transaction_id"], top_k=2)
-    return state
+def retrieve_node(state: DisputeState) -> dict:
+    return {"evidence": retrieve_evidence_semantic(state["customer_message"], state["transaction_id"], top_k=2)}
 
-def draft_node(state: DisputeState) -> DisputeState:
+def draft_node(state: DisputeState) -> dict:
     evidence = state["evidence"]
     assert evidence is not None, "draft_node requires retrieve_node to run first"
-    state["draft"] = draft_from_evidence(state["customer_message"], evidence)
-    return state
+    return {"draft": draft_from_evidence(state["customer_message"], evidence)}
 
 graph = StateGraph(DisputeState)
 graph.add_node("retrieve",retrieve_node)
+graph.add_node("fraud", fraud_node)
 graph.add_node("draft", draft_node)
-graph.set_entry_point("retrieve")
+graph.add_node("critic", critic_node)
+
+graph.add_edge(START, "fraud")
+graph.add_edge(START, "retrieve")
 graph.add_edge("retrieve", "draft")
-graph.add_edge("draft", END)
+graph.add_edge("fraud", "draft")
+
+graph.add_edge("draft", "critic")
+graph.add_edge("critic", END)
+
 app_graph = graph.compile()
 
 # @app.post("/classify")
@@ -161,13 +247,7 @@ app_graph = graph.compile()
 #     return "needs_review — unhandled reason code"
 
 
-# # a tiny pretend database, standing in for real records
-# transactions = [
-#     Transaction("T1", 2499, date(2026, 8, 5), delivered=True, delivery_address_matches_billing=True),
-#     Transaction("T2", 1200, date(2026, 8, 10), delivered=False, delivery_address_matches_billing=False),
-#     Transaction("T3", 50, date(2026, 8, 12), delivered=True, delivery_address_matches_billing=True),
-#     Transaction("T4", 800, date(2026, 8, 15), delivered=True, delivery_address_matches_billing=True),
-#     ]
+
 
 # disputes = [
 #     Dispute(id="D1", transaction_id="T1", reason="unrecognized"),      # this is Priya's case
@@ -217,9 +297,11 @@ def main():
 
     result = app_graph.invoke({
     "customer_message": "I have a duplicate charge on my card, I never ordered anything.",
-    "transaction_id": "T2",
+    "transaction_id": "T1",
     "evidence": None,
+    "fraud_flag": None,
     "draft": None,
+    "critic_verdict": None,
     })
     print(result)
 
