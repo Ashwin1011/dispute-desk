@@ -9,9 +9,15 @@ description = "A multi-agent payment-dispute/chargeback copilot"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "sentence-transformers",
-    "psycopg2-binary",
+    "anthropic",
+    "fastapi",
+    "langgraph",
     "pgvector",
+    "psycopg2-binary",
+    "pydantic",
+    "python-dotenv",
+    "sentence-transformers",
+    "uvicorn",
 ]
 
 [project.optional-dependencies]
@@ -19,8 +25,11 @@ dev = [
     "pytest>=8.0",
 ]
 
+[project.scripts]
+disputedesk = "disputedesk:main"
+
 [tool.setuptools]
-py-modules = ["disputedesk"]
+py-modules = ["disputedesk", "anthropic_api_call"]
 
 [tool.pytest.ini_options]
 testpaths = ["."]

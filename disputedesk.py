@@ -1,12 +1,14 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 from dataclasses import dataclass
 from datetime import date
-from typing import Literal
+from typing import Literal, TypedDict, Optional
+from langgraph.graph import StateGraph, END
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 import psycopg2
 from pgvector.psycopg2 import register_vector
 from anthropic_api_call import client
+from anthropic.types import Message, TextBlock
 from fastapi import FastAPI
 app = FastAPI()
 
@@ -26,6 +28,13 @@ def parse_model_json(text: str) -> str:
             text = text[: text.rfind("```")]
         text = text.strip()
     return text
+
+
+def message_text(message: Message) -> str:
+    for block in message.content:
+        if isinstance(block, TextBlock):
+            return block.text
+    raise TypeError("Claude response had no text block")
 
 
 class DraftClassification(BaseModel):
@@ -52,7 +61,6 @@ class DraftResponse(BaseModel):
     evidence_cited: list[str]
     draft_text: str
     confidence: float
-
 
 def retrieve_evidence(transaction_id: str) -> list[str]:
     return [item.text for item in evidence_items if item.transaction_id == transaction_id]
@@ -93,7 +101,24 @@ and rate your confidence. Respond with ONLY valid JSON matching this shape:
         max_tokens=300,
         messages=[{"role": "user", "content": prompt}],
     )
-    return DraftResponse.model_validate_json(parse_model_json(response.content[0].text))
+    return DraftResponse.model_validate_json(parse_model_json(message_text(response)))
+
+
+class DisputeState(TypedDict):
+    customer_message: str
+    transaction_id: str
+    draft: Optional[DraftResponse]
+
+def draft_node(state: DisputeState) -> DisputeState:
+    result = draft_response(state["customer_message"], state["transaction_id"])
+    state["draft"] = result
+    return state
+
+graph = StateGraph(DisputeState)
+graph.add_node("draft", draft_node)
+graph.set_entry_point("draft")
+graph.add_edge("draft", END)
+app_graph = graph.compile()
 
 @app.post("/classify")
 def classify_endpoint(request: ClassifyRequest) -> DraftClassification:
@@ -163,7 +188,7 @@ Respond with ONLY valid JSON matching this shape, nothing else:
         max_tokens=1024,
         messages=[{"role": "user", "content": prompt}],
     )
-    return DraftClassification.model_validate_json(parse_model_json(response.content[0].text))
+    return DraftClassification.model_validate_json(parse_model_json(message_text(response)))
 
 def main():
     # tx_by_id = {t.id: t for t in transactions}
@@ -172,7 +197,7 @@ def main():
     #     action = recommend_action(d, tx)
     #     print(f"{d.id} (reason: {d.reason}) on {tx.id} (₹{tx.amount}) -> {action}")
 
-    print(draft_response("I don't recognize this charge on my card, I never ordered anything.", "T1"))
+    # print(draft_response("I don't recognize this charge on my card, I never ordered anything.", "T1"))
 
 
     # for item in evidence_items:
@@ -185,6 +210,12 @@ def main():
 
     # print(retrieve_evidence_semantic("the customer says their package never arrived"))
 
+    result = app_graph.invoke({
+    "customer_message": "I have a duplicate charge on my card, I never ordered anything.",
+    "transaction_id": "T2",
+    "draft": None,
+    })
+    print(result)
 
 
 if __name__ == "__main__":

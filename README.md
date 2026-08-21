@@ -39,18 +39,47 @@ Action rules (`recommend_action`):
 
 In-memory records in `disputedesk.py` (T1–T4 / D1–D4, evidence for T1–T3) still stand in for orders. Embeddings for those snippets live in Postgres once seeded (the seed `INSERT` loop is commented in `main()`).
 
+## Python environment (`.venv`)
+
+This machine has several Pythons: pyenv’s global **2.7**, a system **python3**, and this project’s **`.venv`**. Packages like `langgraph` live only in `.venv`. Bare `python disputedesk.py` uses pyenv, not the venv, which is why you see `ModuleNotFoundError`.
+
+A **virtual environment** is an isolated Python for this repo — its own interpreter and installed packages, so this project cannot clash with other projects (or with Python 2.7). `.venv` is that folder; it is gitignored.
+
+Use one of these, every time:
+
+```bash
+source .venv/bin/activate    # prompt shows (.venv)
+python disputedesk.py
+```
+
+```bash
+./run                       # always calls .venv/bin/python
+```
+
+```bash
+.venv/bin/python disputedesk.py
+```
+
+`deactivate` leaves the venv. Cursor is set to use `.venv/bin/python` as the interpreter; pick that if the editor asks.
+
+Optional: make even bare `python` in this folder point at the venv (pyenv):
+
+```bash
+ln -sfn "$(pwd)/.venv" ~/.pyenv/versions/dispute-desk
+pyenv local dispute-desk
+```
+
 ## Setup
 
-Python **3.11+**. The repo pins `3.11.9` in `.python-version`.
+Python **3.11+**. One-time:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
-pip install fastapi uvicorn pydantic anthropic python-dotenv
 ```
 
-`pyproject.toml` already pulls in `sentence-transformers`, `psycopg2-binary`, and `pgvector`.
+`pyproject.toml` is the source of truth for dependencies. Never `pip install` into the global 2.7 `python`.
 
 Create a `.env` in the project root (do not commit it):
 
@@ -80,10 +109,12 @@ Uncomment the seed loop in `main()` once to insert the in-memory `evidence_items
 
 ## Run
 
-**CLI** — current `main()` prints semantic matches for a “package never arrived” query:
+**CLI** — current `main()` runs the LangGraph draft node. Always use the venv:
 
 ```bash
-python disputedesk.py
+./run
+# or
+source .venv/bin/activate && python disputedesk.py
 ```
 
 **API** — FastAPI app, reload on save:
