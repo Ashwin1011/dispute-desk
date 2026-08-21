@@ -14,6 +14,7 @@ from anthropic_api_call import client
 from anthropic.types import Message, TextBlock
 from fastapi import FastAPI
 import statistics
+import json
 app = FastAPI()
 
 embedder = SentenceTransformer("all-MiniLM-L6-v2")
@@ -32,6 +33,23 @@ class Transaction:
     delivered: bool
     delivery_address_matches_billing: bool
 
+def log_decision(thread_id: str, transaction_id: str, node_name: str, decision: dict) -> None:
+    with conn.cursor() as log_cur:
+        log_cur.execute(
+            """
+            INSERT INTO audit_log (thread_id, transaction_id, node_name, decision)
+            VALUES (%s, %s, %s, %s)
+            """,
+            (thread_id, transaction_id, node_name, json.dumps(decision)),
+        )
+    conn.commit()
+
+def get_thread_id(config: RunnableConfig) -> str:
+    configurable = config.get("configurable")
+    assert configurable is not None, "graph must be invoked with a configurable thread_id"
+    thread_id = configurable.get("thread_id")
+    assert thread_id is not None, "graph must be invoked with a configurable thread_id"
+    return thread_id
 
 class Dispute(BaseModel):
     id: str
@@ -118,7 +136,7 @@ def check_grounding(draft: DraftResponse, evidence: list[str]) -> bool:
         for cited in draft.evidence_cited
     )
 
-def critic_node(state: DisputeState) -> dict:
+def critic_node(state: DisputeState, config: RunnableConfig) -> dict:
     draft = state["draft"]
     evidence = state["evidence"]
     fraud_flag = state["fraud_flag"]
@@ -138,6 +156,7 @@ def critic_node(state: DisputeState) -> dict:
         notes = "passed: grounded, no fraud signal"
 
     verdict = CriticVerdict(grounded=grounded, escalate_for_review=escalate, notes=notes)
+    log_decision(get_thread_id(config), state["transaction_id"], "critic", {"grounded": verdict.grounded, "escalate_for_review": verdict.escalate_for_review, "notes": verdict.notes})
     return {"draft": draft, "critic_verdict": verdict}
 
 def parse_model_json(text: str) -> str:
@@ -197,18 +216,26 @@ and rate your confidence. Respond with ONLY valid JSON matching this shape:
     return DraftResponse.model_validate_json(parse_model_json(message_text(response)))
 
 
-def fraud_node(state: DisputeState) -> dict:
-    return {"fraud_flag": check_fraud_signals(state["transaction_id"])}
+def fraud_node(state: DisputeState, config: RunnableConfig) -> dict:
+    flag = check_fraud_signals(state["transaction_id"])
+    log_decision(get_thread_id(config), state["transaction_id"], "fraud", {"z_score": flag.z_score, "is_anomaly": flag.is_anomaly, "note": flag.note})
+    return {"fraud_flag": flag}
 
-def retrieve_node(state: DisputeState) -> dict:
-    return {"evidence": retrieve_evidence_semantic(state["customer_message"], state["transaction_id"], top_k=2)}
+def retrieve_node(state: DisputeState, config: RunnableConfig) -> dict:
+    evidence = retrieve_evidence_semantic(state["customer_message"], state["transaction_id"], top_k=2)
+    log_decision(get_thread_id(config), state["transaction_id"], "retrieve", {"evidence_count": len(evidence), "evidence": evidence})
+    return {"evidence": evidence}
 
-def draft_node(state: DisputeState) -> dict:
+def draft_node(state: DisputeState, config: RunnableConfig) -> dict:
     evidence = state["evidence"]
     assert evidence is not None, "draft_node requires retrieve_node to run first"
-    return {"draft": draft_from_evidence(state["customer_message"], evidence)}
+    draft = draft_from_evidence(state["customer_message"], evidence)
+    log_decision(get_thread_id(config), state["transaction_id"], "draft",
+        {"reason": draft.reason, "confidence": draft.confidence,
+         "evidence_cited": draft.evidence_cited, "draft_text": draft.draft_text},)
+    return {"draft": draft}
 
-def await_approval_node(state: DisputeState) -> dict:
+def await_approval_node(state: DisputeState, config: RunnableConfig) -> dict:
     assert state["draft"] is not None and state["critic_verdict"] is not None
     decision = interrupt({
         "action": "approve_dispute_response",
@@ -216,13 +243,18 @@ def await_approval_node(state: DisputeState) -> dict:
         "critic_notes": state["critic_verdict"].notes,
         "escalate_for_review": state["critic_verdict"].escalate_for_review,
     })
-    return {"approved": bool(decision.get("approved", False))}
+    approved = bool(decision.get("approved", False))
+    log_decision(get_thread_id(config),state["transaction_id"], "await_approval",{"approved": approved},)
+    return {"approved": approved}
 
-def submit_node(state: DisputeState) -> dict:
-    if state["approved"]:
+def submit_node(state: DisputeState, config: RunnableConfig) -> dict:
+    submitted = bool(state["approved"])
+    if submitted:
         print(f"[SUBMITTED] response for {state['transaction_id']}")
+        log_decision(get_thread_id(config), state["transaction_id"], "submit", {"approved": state["approved"], "submitted": True})
         return {"submitted": True}
     print(f"[REJECTED] response for {state['transaction_id']} was not approved")
+    log_decision(get_thread_id(config), state["transaction_id"], "submit", {"approved": state["approved"], "submitted": False})
     return {"submitted": False}
 
 graph = StateGraph(DisputeState)

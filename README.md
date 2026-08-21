@@ -2,9 +2,9 @@
 
 A payment-dispute / chargeback copilot. A LangGraph pipeline retrieves evidence for a transaction, scores a simple fraud signal, asks Claude to classify the complaint and draft a reply that cites the evidence, a critic checks that the draft is grounded, then a human must approve before the reply is “submitted.”
 
-**Current milestone: v4 complete.** Human-in-the-loop: `critic → await_approval` (`interrupt`) → `submit`, with `MemorySaver` so the graph can pause and resume.
+**Current milestone: v3.5.** Human-in-the-loop (v3.4) plus a Postgres `audit_log` row per graph node.
 
-## What it does (through v4)
+## What it does (through v3.5)
 
 `main()` invokes `app_graph` with a customer message and a transaction ID (`T1`–`T4`), then **resumes** with `Command(resume={"approved": True})` after the interrupt. Shared state is `DisputeState`:
 
@@ -68,7 +68,7 @@ Markdown fences around the JSON are stripped (`parse_model_json`). Only Anthropi
 
 `CriticVerdict`: `grounded`, `escalate_for_review`, `notes`.
 
-### Human approval (`await_approval_node` / v4)
+### Human approval (`await_approval_node` / v3.4)
 
 The graph is compiled with `MemorySaver` and a `thread_id` (`dispute-T1-demo` in `main()`). `await_approval_node` calls LangGraph `interrupt({…})` with the draft text, critic notes, and `escalate_for_review`. The first `invoke` returns in a paused state (`PAUSED` in `main()`).
 
@@ -80,9 +80,26 @@ app_graph.invoke(Command(resume={"approved": True}), config=config)
 
 `approved` is stored on state. Without a checkpointer, interrupt/resume cannot continue the same run.
 
-### Submit (`submit_node` / v4)
+### Submit (`submit_node` / v3.4)
 
 If `approved` is true, prints `[SUBMITTED] response for {transaction_id}` and sets `submitted=True`. Otherwise prints `[REJECTED]` and sets `submitted=False`. There is no real PSP/network submit yet — this is the stand-in for “send the reply.”
+
+### Audit log (`log_decision` / v3.5)
+
+Every node writes a JSON decision blob to Postgres `audit_log` (`thread_id`, `transaction_id`, `node_name`, `decision`): retrieve (evidence texts), fraud (z-score), draft (reason + reply), critic (verdict), await_approval (approved), submit (submitted). Use the same `thread_id` as the LangGraph checkpointer (`dispute-T1-demo` in `main()`).
+
+Example table:
+
+```sql
+CREATE TABLE IF NOT EXISTS audit_log (
+    id serial PRIMARY KEY,
+    thread_id text,
+    transaction_id text,
+    node_name text,
+    decision jsonb,
+    created_at timestamptz DEFAULT now()
+);
+```
 
 ### Reason codes
 
@@ -227,4 +244,6 @@ pytest -v
 
 **v3.3** — `fraud_node` (amount z-score, `|z| > 1.5` → anomaly) in parallel with retrieve; both feed `draft`. `critic_node` checks citations against retrieved evidence, retries the draft once if ungrounded, and sets `escalate_for_review` when there is a fraud anomaly or the draft still is not grounded.
 
-**v4** — Human-in-the-loop complete. After critic: `await_approval` (`interrupt` with draft + critic notes), `MemorySaver` checkpointer + `thread_id`, resume via `Command(resume={"approved": True|False})`, then `submit_node` marks the reply submitted or rejected. Demo in `main()` pauses, then auto-resumes with approval.
+**v3.4** — Human-in-the-loop. After critic: `await_approval` (`interrupt` with draft + critic notes), `MemorySaver` checkpointer + `thread_id`, resume via `Command(resume={"approved": True|False})`, then `submit_node` marks the reply submitted or rejected. Demo in `main()` pauses, then auto-resumes with approval.
+
+**v3.5** — Durable audit trail. `log_decision` inserts one `audit_log` row per node (retrieve, fraud, draft, critic, await_approval, submit) keyed by `thread_id` + `transaction_id`.
