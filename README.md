@@ -1,12 +1,12 @@
 # DisputeDesk
 
-A payment-dispute / chargeback copilot. A LangGraph pipeline retrieves evidence for a transaction, scores a simple fraud signal, asks Claude to classify the complaint and draft a reply that cites the evidence, then a critic checks that the draft is grounded.
+A payment-dispute / chargeback copilot. A LangGraph pipeline retrieves evidence for a transaction, scores a simple fraud signal, asks Claude to classify the complaint and draft a reply that cites the evidence, a critic checks that the draft is grounded, then a human must approve before the reply is “submitted.”
 
-**Current milestone: v3.3.** Multi-node graph: retrieve ∥ fraud → draft → critic.
+**Current milestone: v4 complete.** Human-in-the-loop: `critic → await_approval` (`interrupt`) → `submit`, with `MemorySaver` so the graph can pause and resume.
 
-## What it does (v3.x)
+## What it does (through v4)
 
-`main()` invokes `app_graph` with a customer message and a transaction ID (`T1`–`T4`). Shared state is `DisputeState`:
+`main()` invokes `app_graph` with a customer message and a transaction ID (`T1`–`T4`), then **resumes** with `Command(resume={"approved": True})` after the interrupt. Shared state is `DisputeState`:
 
 | Field | Set by | Meaning |
 |---|---|---|
@@ -16,15 +16,17 @@ A payment-dispute / chargeback copilot. A LangGraph pipeline retrieves evidence 
 | `fraud_flag` | `fraud` | Amount z-score vs the fixture set |
 | `draft` | `draft` (maybe rewritten by `critic`) | Reason, citations, reply, confidence |
 | `critic_verdict` | `critic` | Grounded? Escalate? Notes |
+| `approved` | `await_approval` | Human yes/no from `Command(resume=…)` |
+| `submitted` | `submit` | Whether the reply was treated as sent |
 
 Graph:
 
 ```
-START ──► retrieve ──► draft ──► critic ──► END
+START ──► retrieve ──► draft ──► critic ──► await_approval ──► submit ──► END
        └► fraud    ──►
 ```
 
-`retrieve` and `fraud` run from `START` in parallel; both must finish before `draft`.
+`retrieve` and `fraud` run from `START` in parallel; both must finish before `draft`. After the critic, the graph **pauses** until a human resumes it.
 
 ### Retrieve (`retrieve_node` / v3.2)
 
@@ -65,6 +67,22 @@ Markdown fences around the JSON are stripped (`parse_model_json`). Only Anthropi
 - Escalate (`escalate_for_review`) if the fraud flag is an anomaly **or** the draft is still ungrounded after retry.
 
 `CriticVerdict`: `grounded`, `escalate_for_review`, `notes`.
+
+### Human approval (`await_approval_node` / v4)
+
+The graph is compiled with `MemorySaver` and a `thread_id` (`dispute-T1-demo` in `main()`). `await_approval_node` calls LangGraph `interrupt({…})` with the draft text, critic notes, and `escalate_for_review`. The first `invoke` returns in a paused state (`PAUSED` in `main()`).
+
+Resume with:
+
+```python
+app_graph.invoke(Command(resume={"approved": True}), config=config)
+```
+
+`approved` is stored on state. Without a checkpointer, interrupt/resume cannot continue the same run.
+
+### Submit (`submit_node` / v4)
+
+If `approved` is true, prints `[SUBMITTED] response for {transaction_id}` and sets `submitted=True`. Otherwise prints `[REJECTED]` and sets `submitted=False`. There is no real PSP/network submit yet — this is the stand-in for “send the reply.”
 
 ### Reason codes
 
@@ -151,13 +169,15 @@ Uncomment the seed loop in `main()` once to insert evidence rows, then comment i
 
 ## Run
 
-**CLI** — `main()` runs the full graph (retrieve ∥ fraud → draft → critic):
+**CLI** — `main()` runs retrieve ∥ fraud → draft → critic, **pauses** for approval, then resumes with `approved: True` and submit:
 
 ```bash
 ./run
 # or
 source .venv/bin/activate && python disputedesk.py
 ```
+
+You should see `PAUSED —` then `RESUMED —` (and `[SUBMITTED]` if approval was true).
 
 **API** — `POST /classify` is commented out. To serve it again, uncomment the FastAPI route and:
 
@@ -175,7 +195,7 @@ pytest -v
 
 | File | Role |
 |---|---|
-| `disputedesk.py` | Models, pgvector retrieve, fraud z-score, Claude draft, critic, LangGraph |
+| `disputedesk.py` | Models, pgvector retrieve, fraud z-score, Claude draft, critic, HITL interrupt/submit, LangGraph |
 | `anthropic_api_call.py` | Anthropic client (`ANTHROPIC_API_KEY` from `.env`) |
 | `run` | Wrapper that always uses `.venv/bin/python` |
 | `test_disputedesk.py` | Pytest for `recommend_action` (v1) |
@@ -206,3 +226,5 @@ pytest -v
 **v3.2** — `retrieve_node` split from `draft_node`. Retrieve is semantic search **scoped to `transaction_id`**. Graph: `START → retrieve → draft → END`.
 
 **v3.3** — `fraud_node` (amount z-score, `|z| > 1.5` → anomaly) in parallel with retrieve; both feed `draft`. `critic_node` checks citations against retrieved evidence, retries the draft once if ungrounded, and sets `escalate_for_review` when there is a fraud anomaly or the draft still is not grounded.
+
+**v4** — Human-in-the-loop complete. After critic: `await_approval` (`interrupt` with draft + critic notes), `MemorySaver` checkpointer + `thread_id`, resume via `Command(resume={"approved": True|False})`, then `submit_node` marks the reply submitted or rejected. Demo in `main()` pauses, then auto-resumes with approval.

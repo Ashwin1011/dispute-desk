@@ -3,6 +3,9 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Literal, TypedDict, Optional
 from langgraph.graph import StateGraph, END, START
+from langgraph.checkpoint.memory import MemorySaver
+from langchain_core.runnables import RunnableConfig
+from langgraph.types import interrupt, Command
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 import psycopg2
@@ -102,6 +105,8 @@ class DisputeState(TypedDict):
     fraud_flag: Optional[FraudFlag]
     draft: Optional[DraftResponse]
     critic_verdict: Optional[CriticVerdict]
+    approved: Optional[bool]
+    submitted: Optional[bool]
 
 def _normalize(text: str) -> str:
     return text.strip().rstrip(".").lower()
@@ -203,21 +208,43 @@ def draft_node(state: DisputeState) -> dict:
     assert evidence is not None, "draft_node requires retrieve_node to run first"
     return {"draft": draft_from_evidence(state["customer_message"], evidence)}
 
+def await_approval_node(state: DisputeState) -> dict:
+    assert state["draft"] is not None and state["critic_verdict"] is not None
+    decision = interrupt({
+        "action": "approve_dispute_response",
+        "draft_text": state["draft"].draft_text,
+        "critic_notes": state["critic_verdict"].notes,
+        "escalate_for_review": state["critic_verdict"].escalate_for_review,
+    })
+    return {"approved": bool(decision.get("approved", False))}
+
+def submit_node(state: DisputeState) -> dict:
+    if state["approved"]:
+        print(f"[SUBMITTED] response for {state['transaction_id']}")
+        return {"submitted": True}
+    print(f"[REJECTED] response for {state['transaction_id']} was not approved")
+    return {"submitted": False}
+
 graph = StateGraph(DisputeState)
 graph.add_node("retrieve",retrieve_node)
 graph.add_node("fraud", fraud_node)
 graph.add_node("draft", draft_node)
 graph.add_node("critic", critic_node)
+graph.add_node("await_approval", await_approval_node)
+graph.add_node("submit", submit_node)
 
 graph.add_edge(START, "fraud")
 graph.add_edge(START, "retrieve")
 graph.add_edge("retrieve", "draft")
 graph.add_edge("fraud", "draft")
-
 graph.add_edge("draft", "critic")
-graph.add_edge("critic", END)
 
-app_graph = graph.compile()
+graph.add_edge("critic", "await_approval")
+graph.add_edge("await_approval", "submit")
+graph.add_edge("submit", END)
+
+checkpointer = MemorySaver()
+app_graph = graph.compile(checkpointer=checkpointer)
 
 # @app.post("/classify")
 # def classify_endpoint(request: ClassifyRequest) -> DraftClassification:
@@ -295,6 +322,8 @@ def main():
 
     # print(retrieve_evidence_semantic("the customer says their package never arrived"))
 
+    config: RunnableConfig = {"configurable": {"thread_id": "dispute-T1-demo"}}
+
     result = app_graph.invoke({
     "customer_message": "I have a duplicate charge on my card, I never ordered anything.",
     "transaction_id": "T1",
@@ -302,8 +331,12 @@ def main():
     "fraud_flag": None,
     "draft": None,
     "critic_verdict": None,
-    })
-    print(result)
+    "approved": None,
+    "submitted": None,
+    },config=config)
+    print("PAUSED —", result)
+    result = app_graph.invoke(Command(resume={"approved": True}), config=config)
+    print("RESUMED —", result)
 
 
 if __name__ == "__main__":
