@@ -26,6 +26,11 @@ dev = [
     "pytest>=8.0",
 ]
 
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
 [project.scripts]
 disputedesk = "disputedesk:main"
 

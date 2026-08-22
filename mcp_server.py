@@ -8,15 +8,16 @@ mcp = MCPServer("DisputeDesk")
 
 
 @mcp.tool()
-def resolve_dispute(transaction_id: str, customer_message: str) -> dict:
+def resolve_dispute(tenant_id: str, transaction_id: str, customer_message: str) -> dict:
     """Run DisputeDesk's multi-agent graph on a payment dispute: retrieves evidence,
     checks for fraud signals, drafts a response, and fact-checks it. Routine cases
     submit automatically; anomalous or ungrounded ones pause for human approval —
     call approve_dispute with the returned thread_id to complete those."""
-    thread_id = f"dispute-{transaction_id}"
+    thread_id = f"dispute-{tenant_id}-{transaction_id}"
     config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
     result = app_graph.invoke({
         "customer_message": customer_message,
+        "tenant_id": tenant_id,
         "transaction_id": transaction_id,
         "evidence": None,
         "fraud_flag": None,

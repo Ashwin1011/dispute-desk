@@ -2,18 +2,21 @@
 
 A payment-dispute / chargeback copilot. A LangGraph pipeline retrieves evidence for a transaction, scores a simple fraud signal, asks Claude to classify the complaint and draft a reply that cites the evidence, and a critic checks that the draft is grounded. A human is asked to approve **only when** the critic escalates; otherwise submit is automatic. The same graph is exposed as an MCP server so Cursor (or any MCP client) can run and approve disputes as tools.
 
-**Current milestone: v4 complete.** MCP: `resolve_dispute` / `approve_dispute` wrap `app_graph` over stdio.
+Evidence, fraud scoring, and MCP calls are **scoped to a tenant**. A tenant cannot retrieve another tenant’s evidence or score fraud on another tenant’s transactions.
 
-## What it does (through v4)
+**Current milestone: v5 complete.** Multi-tenant isolation on retrieve, fraud, MCP (`tenant_id`), and permission-boundary tests.
 
-`main()` invokes `app_graph` with a customer message and transaction **T2**. If the critic escalates, the run **pauses** and `main()` resumes with `Command(resume={"approved": True})`. If it does not escalate, the first `invoke` finishes through `submit` (auto-approved) and there is nothing to resume. Shared state is `DisputeState`:
+## What it does (through v5)
+
+`main()` invokes `app_graph` with a customer message, tenant **electromart**, and transaction **T1**. If the critic escalates, the run **pauses** and `main()` resumes with `Command(resume={"approved": True})`. If it does not escalate, the first `invoke` finishes through `submit` (auto-approved) and there is nothing to resume. Shared state is `DisputeState`:
 
 | Field              | Set by                                | Meaning                               |
 | ------------------ | ------------------------------------- | ------------------------------------- |
 | `customer_message` | input                                 | Free-text complaint                   |
+| `tenant_id`        | input                                 | Which merchant owns the order         |
 | `transaction_id`   | input                                 | Which order to look up (`T1` …)       |
 | `evidence`         | `retrieve`                            | Top-k evidence strings from Postgres  |
-| `fraud_flag`       | `fraud`                               | Amount z-score vs the fixture set     |
+| `fraud_flag`       | `fraud`                               | Amount z-score vs that tenant’s txs   |
 | `draft`            | `draft` (maybe rewritten by `critic`) | Reason, citations, reply, confidence  |
 | `critic_verdict`   | `critic`                              | Grounded? Escalate? Notes             |
 | `approved`         | `await_approval`                      | Human yes/no from `Command(resume=…)` |
@@ -28,19 +31,30 @@ START ──► retrieve ──► draft ──► critic ──┬── (escal
 
 `retrieve` and `fraud` run from `START` in parallel; both must finish before `draft`. After the critic, `route_after_critic` sends the run to `await_approval` only when `escalate_for_review` is true; otherwise it skips the human and goes to `submit`.
 
-### Retrieve (`retrieve_node` / v3.2)
+### Retrieve (`retrieve_node` / v3.2, tenant-scoped in v5)
 
-`retrieve_evidence_semantic(query, transaction_id, top_k=2)`:
+`retrieve_evidence_semantic(query, tenant_id, transaction_id, top_k=2)`:
 
 1. Embeds the customer message with `SentenceTransformer("all-MiniLM-L6-v2")` (384-d).
-2. Queries Postgres `evidence` with pgvector cosine distance (`<=>`), **filtered to that `transaction_id`**.
-3. Returns the closest `top_k` texts.
+2. Queries Postgres `evidence` with pgvector cosine distance (`<=>`), **filtered to that `tenant_id` and `transaction_id`**.
+3. Returns the closest `top_k` texts. A wrong tenant gets an empty list (no cross-tenant leakage).
 
 Earlier (v2.7) this was in-memory “grab every `EvidenceItem` for this ID” with no embeddings. That helper is commented out.
 
-### Fraud (`fraud_node` / v3.3)
+### Fraud (`fraud_node` / v3.3, tenant-scoped in v5)
 
-`check_fraud_signals(transaction_id)` looks up the fixture `Transaction` and computes a z-score of its `amount` against all fixture amounts (`statistics.mean` / `pstdev`). If `|z| > 1.5`, `is_anomaly` is true and the note says the amount is flagged for review. Four rows (`T1` ₹2499, `T2` ₹1200, `T3` ₹50, `T4` ₹800) — T1 is the outlier.
+`check_fraud_signals(tenant_id, transaction_id)` looks up the fixture `Transaction` **among that tenant’s rows only** and computes a z-score of its `amount` against that tenant’s amounts (`statistics.mean` / `pstdev`). If the id is missing for that tenant, it returns `note="transaction not found for this tenant"` and does not score another merchant’s order.
+
+If `|z| > 1.5`, `is_anomaly` is true and the note says the amount is flagged for review.
+
+Fixtures:
+
+| ID | Tenant        | Amount |
+| -- | ------------- | ------ |
+| T1 | electromart   | ₹2499  |
+| T2 | electromart   | ₹1200  |
+| T3 | subscribebox  | ₹50    |
+| T4 | subscribebox  | ₹800   |
 
 Output is `FraudFlag(z_score, is_anomaly, note)`.
 
@@ -70,7 +84,7 @@ Markdown fences around the JSON are stripped (`parse_model_json`). Only Anthropi
 
 ### Human approval (`await_approval_node` / v3.4, routed in v3.6)
 
-Reached **only if** the critic set `escalate_for_review` (fraud anomaly or still-ungrounded draft). The graph is compiled with `MemorySaver` and a `thread_id` (`dispute-T1-demo` in `main()`). `await_approval_node` calls LangGraph `interrupt({…})` with the draft text, critic notes, and `escalate_for_review`. That `invoke` returns paused (`PAUSED` in `main()`).
+Reached **only if** the critic set `escalate_for_review` (fraud anomaly or still-ungrounded draft). The graph is compiled with `MemorySaver` and a `thread_id` (`dispute-T1-demo` in `main()`; MCP uses `dispute-{tenant_id}-{transaction_id}`). `await_approval_node` calls LangGraph `interrupt({…})` with the draft text, critic notes, and `escalate_for_review`. That `invoke` returns paused (`PAUSED` in `main()`).
 
 Resume with:
 
@@ -89,7 +103,7 @@ Prints `[SUBMITTED] … (auto|human)` or `[REJECTED]`. There is no real PSP/netw
 
 ### Audit log (`log_decision` / v3.5)
 
-Every node writes a JSON decision blob to Postgres `audit_log` (`thread_id`, `transaction_id`, `node_name`, `decision`): retrieve (evidence texts), fraud (z-score), draft (reason + reply), critic (verdict), await_approval (approved, if HITL ran), submit (`submitted` + `approval_source`). Use the same `thread_id` as the LangGraph checkpointer (`dispute-T1-demo` in `main()`).
+Every node writes a JSON decision blob to Postgres `audit_log` (`thread_id`, `transaction_id`, `node_name`, `decision`): retrieve (tenant + evidence texts), fraud (tenant + z-score), draft (reason + reply), critic (verdict), await_approval (approved, if HITL ran), submit (`submitted` + `approval_source`). Use the same `thread_id` as the LangGraph checkpointer.
 
 Example table:
 
@@ -104,14 +118,16 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 ```
 
-### MCP (`mcp_server.py` / v4)
+### MCP (`mcp_server.py` / v4, `tenant_id` in v5)
 
 `MCPServer("DisputeDesk")` from `mcp[cli]>=2.0` exposes the compiled graph as two stdio tools. The graph itself is unchanged; this is an interface in front of `app_graph.invoke`.
 
-| Tool              | Arguments                         | What it does                                                                                                                                                                                              |
-| ----------------- | --------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `resolve_dispute` | `transaction_id`, `customer_message` | `invoke` with `thread_id=dispute-{transaction_id}`. If the graph interrupts, returns `status=awaiting_approval` plus `draft_text` / `critic_notes`. Otherwise `submitted` or `rejected`.                 |
-| `approve_dispute` | `thread_id`, `approved`           | `Command(resume={"approved": …})` on that thread. Returns `submitted` or `rejected` and the draft text.                                                                                                   |
+| Tool              | Arguments                                      | What it does                                                                                                                                                                                              |
+| ----------------- | ---------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `resolve_dispute` | `tenant_id`, `transaction_id`, `customer_message` | `invoke` with `thread_id=dispute-{tenant_id}-{transaction_id}`. If the graph interrupts, returns `status=awaiting_approval` plus `draft_text` / `critic_notes`. Otherwise `submitted` or `rejected`.   |
+| `approve_dispute` | `thread_id`, `approved`                        | `Command(resume={"approved": …})` on that thread. Returns `submitted` or `rejected` and the draft text.                                                                                                   |
+
+Example: resolve T1 for tenant `electromart` with `"I never received this order."` Clean cases finish in one `resolve_dispute` call; escalate cases return `awaiting_approval` and need `approve_dispute` with the returned `thread_id`.
 
 Cursor is configured in `.cursor/mcp.json`. The command is this project’s **`.venv/bin/python`** with an absolute path to `mcp_server.py` — not bare `uv` / `python`. Cursor’s GUI process does not inherit the shell PATH, so `spawn uv ENOENT` is what you get if the command is just `uv`.
 
@@ -126,17 +142,24 @@ Cursor is configured in `.cursor/mcp.json`. The command is this project’s **`.
 
 ### Still in the file, not on the live path
 
-v1 `recommend_action` (contest / accept / needs_review from delivery flags) and v2 `classify_dispute` + FastAPI `POST /classify` are commented out. Pytest still targets `recommend_action` and will fail until that function is restored or the tests are updated.
+v1 `recommend_action` (contest / accept / needs_review from delivery flags) and v2 `classify_dispute` + FastAPI `POST /classify` are commented out. `tests/test_disputedesk.py` still targets `recommend_action` and will fail until that function is restored or those tests are updated.
 
-Fixture transactions T1–T4 remain in memory. Evidence embeddings live in Postgres after a one-time seed (the `INSERT` loop in `main()` is commented).
+Fixture transactions T1–T4 remain in memory (each with a `tenant_id`). Evidence embeddings live in Postgres after a one-time seed (`uv run python seed_evidence.py`).
 
 ## Python environment (`.venv`)
 
 This machine has several Pythons: pyenv’s global **2.7**, a system **python3**, and this project’s **`.venv`**. Packages like `langgraph` live only in `.venv`. Bare `python disputedesk.py` uses pyenv, not the venv, which is why you see `ModuleNotFoundError`.
 
+The same trap hits tests: bare `pytest` (or `uv run pytest` **before** pytest is in the project env) can pick up `/Library/Frameworks/Python.framework/.../python3`, which does not have `langgraph`. Always run tests with `uv run pytest` after `uv sync`, so pytest is `.venv/bin/pytest`.
+
 A **virtual environment** is an isolated Python for this repo — its own interpreter and installed packages, so this project cannot clash with other projects (or with Python 2.7). `.venv` is that folder; it is gitignored.
 
 Use one of these, every time:
+
+```bash
+uv run python disputedesk.py
+uv run pytest tests/test_permission_boundary.py -v
+```
 
 ```bash
 source .venv/bin/activate    # prompt shows (.venv)
@@ -162,15 +185,21 @@ pyenv local dispute-desk
 
 ## Setup
 
-Python **3.11+**. One-time:
+Python **3.11+**. One-time (preferred):
+
+```bash
+uv sync
+```
+
+That installs runtime deps plus the default `dev` group (`pytest`) into `.venv`. `pyproject.toml` is the source of truth (`langgraph`, `anthropic`, `sentence-transformers`, `psycopg2-binary`, `pgvector`, FastAPI/uvicorn, `mcp[cli]`, pytest). Never `pip install` into the global 2.7 `python`.
+
+Pip alternative:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
 ```
-
-`pyproject.toml` is the source of truth (`langgraph`, `anthropic`, `sentence-transformers`, `psycopg2-binary`, `pgvector`, FastAPI/uvicorn, `mcp[cli]`, pytest). Never `pip install` into the global 2.7 `python`.
 
 Create a `.env` in the project root (do not commit it):
 
@@ -190,27 +219,34 @@ host=localhost port=5432 dbname=postgres user=postgres password=devpassword
 CREATE EXTENSION IF NOT EXISTS vector;
 
 CREATE TABLE IF NOT EXISTS evidence (
+    tenant_id text,
     transaction_id text,
     text text,
     embedding vector(384)
 );
 ```
 
-Uncomment the seed loop in `main()` once to insert evidence rows, then comment it again so you do not duplicate them.
+Seed evidence once (do not re-run without clearing rows, or you will duplicate them):
+
+```bash
+uv run python seed_evidence.py
+```
 
 ## Run
 
-**CLI** — `main()` runs T2: retrieve ∥ fraud → draft → critic, then either auto-submit or pause + resume:
+**CLI** — `main()` runs electromart T1: retrieve ∥ fraud → draft → critic, then either auto-submit or pause + resume:
 
 ```bash
+uv run python disputedesk.py
+# or
 ./run
 # or
 source .venv/bin/activate && python disputedesk.py
 ```
 
-T2 is near the fixture mean, so if the draft is grounded there is **no** interrupt (`[SUBMITTED] … (auto)`). T1 (`₹2499`) is the fraud outlier and typically hits HITL. The demo still calls `Command(resume=…)` after the first invoke; that only applies if the graph actually paused.
+T1 (`₹2499`) is the large electromart amount and typically hits HITL. T2 is nearer that tenant’s mean; if the draft is grounded there is **no** interrupt (`[SUBMITTED] … (auto)`). The demo still calls `Command(resume=…)` after the first invoke; that only applies if the graph actually paused.
 
-**MCP** — Cursor loads `.cursor/mcp.json` and spawns `mcp_server.py` over stdio. Ask the agent to resolve a dispute (e.g. T2 with a customer message). Clean cases finish in one `resolve_dispute` call; escalate cases return `awaiting_approval` and need `approve_dispute` with the returned `thread_id`.
+**MCP** — Cursor loads `.cursor/mcp.json` and spawns `mcp_server.py` over stdio. Ask the agent to resolve a dispute for a tenant (e.g. electromart T1 with `"I never received this order."`). Clean cases finish in one `resolve_dispute` call; escalate cases return `awaiting_approval` and need `approve_dispute` with the returned `thread_id`.
 
 To run the server by hand (same interpreter the MCP config uses):
 
@@ -221,26 +257,30 @@ To run the server by hand (same interpreter the MCP config uses):
 **API** — `POST /classify` is commented out. To serve it again, uncomment the FastAPI route and:
 
 ```bash
-uvicorn disputedesk:app --reload
+uv run uvicorn disputedesk:app --reload
 ```
 
-**Tests** (v1 rules engine; currently import `recommend_action`, which is commented):
+**Tests** — tenant isolation (live path). Needs Postgres with seeded evidence:
 
 ```bash
-pytest -v
+uv run pytest tests/test_permission_boundary.py -v
 ```
+
+`tests/test_disputedesk.py` still imports v1 `recommend_action` (commented out) and is not part of the live path.
 
 ## Layout
 
-| File                    | Role                                                                                             |
-| ----------------------- | ------------------------------------------------------------------------------------------------ |
-| `disputedesk.py`        | Models, pgvector retrieve, fraud z-score, Claude draft, critic, HITL interrupt/submit, LangGraph |
-| `mcp_server.py`         | MCP stdio server: `resolve_dispute` / `approve_dispute` wrap `app_graph`                         |
-| `.cursor/mcp.json`      | Cursor MCP config (absolute `.venv/bin/python` + `mcp_server.py`)                                |
-| `anthropic_api_call.py` | Anthropic client (`ANTHROPIC_API_KEY` from `.env`)                                               |
-| `run`                   | Wrapper that always uses `.venv/bin/python`                                                      |
-| `test_disputedesk.py`   | Pytest for `recommend_action` (v1)                                                               |
-| `conftest.py`           | Fails fast if pytest is run on Python &lt; 3.11                                                  |
+| File                                 | Role                                                                                             |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------ |
+| `disputedesk.py`                     | Models, tenant-scoped pgvector retrieve, fraud z-score, Claude draft, critic, HITL, LangGraph    |
+| `mcp_server.py`                      | MCP stdio server: `resolve_dispute` / `approve_dispute` wrap `app_graph`                         |
+| `seed_evidence.py`                   | One-time insert of fixture evidence rows (tenant_id + embedding) into Postgres                   |
+| `.cursor/mcp.json`                   | Cursor MCP config (absolute `.venv/bin/python` + `mcp_server.py`)                                |
+| `anthropic_api_call.py`              | Anthropic client (`ANTHROPIC_API_KEY` from `.env`)                                               |
+| `run`                                | Wrapper that always uses `.venv/bin/python`                                                      |
+| `tests/test_permission_boundary.py`  | Pytest: wrong tenant gets no evidence / no fraud signal; correct tenant still retrieves          |
+| `tests/test_disputedesk.py`          | Pytest for `recommend_action` (v1, not on the live path)                                         |
+| `conftest.py`                        | Fails fast if pytest is run on Python &lt; 3.11                                                  |
 
 ## Version history
 
@@ -275,3 +315,5 @@ pytest -v
 **v3.6** — Conditional HITL. `route_after_critic` sends escalate cases to `await_approval` and clean cases straight to `submit`. `submit_node` records `approval_source` as `auto`, `human`, or `human_rejected`.
 
 **v4** — MCP server. `mcp_server.py` (`MCPServer`, stdio) exposes `resolve_dispute` and `approve_dispute` over the same `app_graph`. Cursor config is `.cursor/mcp.json` using `.venv/bin/python` so the GUI spawn does not depend on `uv` being on PATH. (v4 complete.)
+
+**v5** — Multi-tenant isolation. `tenant_id` on `Transaction`, `EvidenceItem`, `DisputeState`, Postgres `evidence`, retrieve (`WHERE tenant_id AND transaction_id`), and fraud (z-score against that tenant’s amounts only; unknown pair → `"transaction not found for this tenant"`). MCP `resolve_dispute` takes `tenant_id`; thread ids are `dispute-{tenant_id}-{transaction_id}`. Seed via `seed_evidence.py`. Permission-boundary tests in `tests/test_permission_boundary.py`. Run tests with `uv run pytest` so pytest uses `.venv`, not system Python. (v5 complete.)

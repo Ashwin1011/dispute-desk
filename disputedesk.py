@@ -28,6 +28,7 @@ register_vector(conn)  # teaches psycopg2 how to send Python vectors to Postgres
 @dataclass
 class Transaction:
     id: str
+    tenant_id: str
     amount: float
     order_date: date
     delivered: bool
@@ -67,15 +68,22 @@ class ClassifyRequest(BaseModel):
 
 @dataclass
 class EvidenceItem:
+    tenant_id: str
     transaction_id: str
     text: str
 
+evidence_items = [
+    EvidenceItem("electromart", "T1", "Courier tracking TRK556 shows delivered Aug 9, signed at the billing address."),
+    EvidenceItem("electromart", "T2", "No delivery confirmation on file for this order."),
+    EvidenceItem("subscribebox", "T3", "Order history shows only one charge of ₹50 on this date — no duplicate found."),
+]
+
 # a tiny pretend database, standing in for real records
 transactions = [
-    Transaction("T1", 2499, date(2026, 8, 5), delivered=True, delivery_address_matches_billing=True),
-    Transaction("T2", 1200, date(2026, 8, 10), delivered=False, delivery_address_matches_billing=False),
-    Transaction("T3", 50, date(2026, 8, 12), delivered=True, delivery_address_matches_billing=True),
-    Transaction("T4", 800, date(2026, 8, 15), delivered=True, delivery_address_matches_billing=True),
+    Transaction("T1","electromart", 2499, date(2026, 8, 5), delivered=True, delivery_address_matches_billing=True),
+    Transaction("T2","electromart", 1200, date(2026, 8, 10), delivered=False, delivery_address_matches_billing=False),
+    Transaction("T3","subscribebox", 50, date(2026, 8, 12), delivered=True, delivery_address_matches_billing=True),
+    Transaction("T4","subscribebox", 800, date(2026, 8, 15), delivered=True, delivery_address_matches_billing=True),
     ]
 
 import statistics
@@ -85,12 +93,13 @@ class FraudFlag(BaseModel):
     is_anomaly: bool
     note: str
 
-def check_fraud_signals(transaction_id: str) -> FraudFlag:
-    tx = next((t for t in transactions if t.id == transaction_id), None)
+def check_fraud_signals(tenant_id: str, transaction_id: str) -> FraudFlag:
+    tenant_txs = [t for t in transactions if t.tenant_id == tenant_id]
+    tx = next((t for t in tenant_txs if t.id == transaction_id), None)
     if tx is None:
-        return FraudFlag(z_score=0.0, is_anomaly=False, note="transaction not found")
+        return FraudFlag(z_score=0.0, is_anomaly=False, note="transaction not found for this tenant")
 
-    amounts = [t.amount for t in transactions]
+    amounts = [t.amount for t in tenant_txs]
     mean = statistics.mean(amounts)
     stdev = statistics.pstdev(amounts) or 1.0  # guard divide-by-zero if all amounts match
 
@@ -118,6 +127,7 @@ class DraftResponse(BaseModel):
 
 class DisputeState(TypedDict):
     customer_message: str
+    tenant_id: str
     transaction_id: str
     evidence: Optional[list[str]]
     fraud_flag: Optional[FraudFlag]
@@ -184,17 +194,17 @@ def message_text(message: Message) -> str:
 
 cur = conn.cursor()
 
-def retrieve_evidence_semantic(query_text: str, transaction_id: str, top_k: int = 2) -> list[str]:
+def retrieve_evidence_semantic(query_text: str, tenant_id: str, transaction_id: str, top_k: int = 2) -> list[str]:
     query_vector = embedder.encode(query_text)
     cur.execute(
         """
         SELECT text, embedding <=> %s AS distance
         FROM evidence
-        WHERE transaction_id = %s
+        WHERE tenant_id = %s AND transaction_id = %s
         ORDER BY distance
         LIMIT %s
         """,
-        (query_vector, transaction_id, top_k),
+        (query_vector, tenant_id, transaction_id, top_k),
     )
     rows = cur.fetchall()
     return [text for text, distance in rows]
@@ -222,13 +232,13 @@ and rate your confidence. Respond with ONLY valid JSON matching this shape:
 
 
 def fraud_node(state: DisputeState, config: RunnableConfig) -> dict:
-    flag = check_fraud_signals(state["transaction_id"])
-    log_decision(get_thread_id(config), state["transaction_id"], "fraud", {"z_score": flag.z_score, "is_anomaly": flag.is_anomaly, "note": flag.note})
+    flag = check_fraud_signals(state["tenant_id"], state["transaction_id"])
+    log_decision(get_thread_id(config), state["transaction_id"], "fraud", {"teanant_id": state["tenant_id"],"z_score": flag.z_score, "is_anomaly": flag.is_anomaly, "note": flag.note})
     return {"fraud_flag": flag}
 
 def retrieve_node(state: DisputeState, config: RunnableConfig) -> dict:
-    evidence = retrieve_evidence_semantic(state["customer_message"], state["transaction_id"], top_k=2)
-    log_decision(get_thread_id(config), state["transaction_id"], "retrieve", {"evidence_count": len(evidence), "evidence": evidence})
+    evidence = retrieve_evidence_semantic(state["customer_message"], state["tenant_id"], state["transaction_id"], top_k=2)
+    log_decision(get_thread_id(config), state["transaction_id"], "retrieve", {"tenant_id": state["tenant_id"], "transaction_id": state["transaction_id"], "evidence_count": len(evidence), "evidence": evidence})
     return {"evidence": evidence}
 
 def draft_node(state: DisputeState, config: RunnableConfig) -> dict:
@@ -299,11 +309,7 @@ app_graph = graph.compile(checkpointer=checkpointer)
 # def classify_endpoint(request: ClassifyRequest) -> DraftClassification:
 #     return classify_dispute(request.customer_message)
 
-# evidence_items = [
-#     EvidenceItem("T1", "Courier tracking TRK556 shows delivered Aug 9, signed at the billing address."),
-#     EvidenceItem("T2", "No delivery confirmation on file for this order."),
-#     EvidenceItem("T3", "Order history shows only one charge of ₹50 on this date — no duplicate found."),
-# ]
+
 
 
 # def recommend_action(dispute: Dispute, transaction: Transaction) -> str:
@@ -352,10 +358,11 @@ app_graph = graph.compile(checkpointer=checkpointer)
 #     return DraftClassification.model_validate_json(parse_model_json(message_text(response)))
 
 
-def run_dispute(customer_message: str, transaction_id: str, thread_id: str) -> dict:
+def run_dispute(customer_message: str, tenant_id: str, transaction_id: str, thread_id: str) -> dict:
     config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
     result = app_graph.invoke({
         "customer_message": customer_message,
+        "tenant_id": tenant_id,
         "transaction_id": transaction_id,
         "evidence": None,
         "fraud_flag": None,
@@ -394,8 +401,8 @@ def main():
 
     # print(retrieve_evidence_semantic("the customer says their package never arrived"))
 
-    run_dispute("I have a duplicate charge on my card, I never ordered anything.", "T1", "dispute-T1-demo")
-    run_dispute("I have a duplicate charge on my card, I never ordered anything.", "T2", "dispute-T2-demo")
+    run_dispute("I have a duplicate charge on my card, I never ordered anything.", "electromart", "T1", "dispute-T1-demo")
+    # run_dispute("I have a duplicate charge on my card, I never ordered anything.", "T2", "dispute-T2-demo")
 
 
 if __name__ == "__main__":
