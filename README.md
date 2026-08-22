@@ -1,23 +1,23 @@
 # DisputeDesk
 
-A payment-dispute / chargeback copilot. A LangGraph pipeline retrieves evidence for a transaction, scores a simple fraud signal, asks Claude to classify the complaint and draft a reply that cites the evidence, and a critic checks that the draft is grounded. A human is asked to approve **only when** the critic escalates; otherwise submit is automatic.
+A payment-dispute / chargeback copilot. A LangGraph pipeline retrieves evidence for a transaction, scores a simple fraud signal, asks Claude to classify the complaint and draft a reply that cites the evidence, and a critic checks that the draft is grounded. A human is asked to approve **only when** the critic escalates; otherwise submit is automatic. The same graph is exposed as an MCP server so Cursor (or any MCP client) can run and approve disputes as tools.
 
-**Current milestone: v3.6.** Conditional HITL: `critic` → `await_approval` if `escalate_for_review`, else straight to `submit`.
+**Current milestone: v4 complete.** MCP: `resolve_dispute` / `approve_dispute` wrap `app_graph` over stdio.
 
-## What it does (through v3.6)
+## What it does (through v4)
 
 `main()` invokes `app_graph` with a customer message and transaction **T2**. If the critic escalates, the run **pauses** and `main()` resumes with `Command(resume={"approved": True})`. If it does not escalate, the first `invoke` finishes through `submit` (auto-approved) and there is nothing to resume. Shared state is `DisputeState`:
 
-| Field | Set by | Meaning |
-|---|---|---|
-| `customer_message` | input | Free-text complaint |
-| `transaction_id` | input | Which order to look up (`T1` …) |
-| `evidence` | `retrieve` | Top-k evidence strings from Postgres |
-| `fraud_flag` | `fraud` | Amount z-score vs the fixture set |
-| `draft` | `draft` (maybe rewritten by `critic`) | Reason, citations, reply, confidence |
-| `critic_verdict` | `critic` | Grounded? Escalate? Notes |
-| `approved` | `await_approval` | Human yes/no from `Command(resume=…)` |
-| `submitted` | `submit` | Whether the reply was treated as sent |
+| Field              | Set by                                | Meaning                               |
+| ------------------ | ------------------------------------- | ------------------------------------- |
+| `customer_message` | input                                 | Free-text complaint                   |
+| `transaction_id`   | input                                 | Which order to look up (`T1` …)       |
+| `evidence`         | `retrieve`                            | Top-k evidence strings from Postgres  |
+| `fraud_flag`       | `fraud`                               | Amount z-score vs the fixture set     |
+| `draft`            | `draft` (maybe rewritten by `critic`) | Reason, citations, reply, confidence  |
+| `critic_verdict`   | `critic`                              | Grounded? Escalate? Notes             |
+| `approved`         | `await_approval`                      | Human yes/no from `Command(resume=…)` |
+| `submitted`        | `submit`                              | Whether the reply was treated as sent |
 
 Graph:
 
@@ -104,13 +104,24 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 ```
 
+### MCP (`mcp_server.py` / v4)
+
+`MCPServer("DisputeDesk")` from `mcp[cli]>=2.0` exposes the compiled graph as two stdio tools. The graph itself is unchanged; this is an interface in front of `app_graph.invoke`.
+
+| Tool              | Arguments                         | What it does                                                                                                                                                                                              |
+| ----------------- | --------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `resolve_dispute` | `transaction_id`, `customer_message` | `invoke` with `thread_id=dispute-{transaction_id}`. If the graph interrupts, returns `status=awaiting_approval` plus `draft_text` / `critic_notes`. Otherwise `submitted` or `rejected`.                 |
+| `approve_dispute` | `thread_id`, `approved`           | `Command(resume={"approved": …})` on that thread. Returns `submitted` or `rejected` and the draft text.                                                                                                   |
+
+Cursor is configured in `.cursor/mcp.json`. The command is this project’s **`.venv/bin/python`** with an absolute path to `mcp_server.py` — not bare `uv` / `python`. Cursor’s GUI process does not inherit the shell PATH, so `spawn uv ENOENT` is what you get if the command is just `uv`.
+
 ### Reason codes
 
-| Reason | Meaning |
-|---|---|
-| `unrecognized` | Customer does not recognize the charge |
-| `product_not_received` | Paid, but nothing arrived |
-| `duplicate` | Charged more than once |
+| Reason                 | Meaning                                          |
+| ---------------------- | ------------------------------------------------ |
+| `unrecognized`         | Customer does not recognize the charge           |
+| `product_not_received` | Paid, but nothing arrived                        |
+| `duplicate`            | Charged more than once                           |
 | `product_unacceptable` | Received, but wrong / damaged / not as described |
 
 ### Still in the file, not on the live path
@@ -159,7 +170,7 @@ source .venv/bin/activate
 pip install -e ".[dev]"
 ```
 
-`pyproject.toml` is the source of truth (`langgraph`, `anthropic`, `sentence-transformers`, `psycopg2-binary`, `pgvector`, FastAPI/uvicorn, pytest). Never `pip install` into the global 2.7 `python`.
+`pyproject.toml` is the source of truth (`langgraph`, `anthropic`, `sentence-transformers`, `psycopg2-binary`, `pgvector`, FastAPI/uvicorn, `mcp[cli]`, pytest). Never `pip install` into the global 2.7 `python`.
 
 Create a `.env` in the project root (do not commit it):
 
@@ -199,6 +210,14 @@ source .venv/bin/activate && python disputedesk.py
 
 T2 is near the fixture mean, so if the draft is grounded there is **no** interrupt (`[SUBMITTED] … (auto)`). T1 (`₹2499`) is the fraud outlier and typically hits HITL. The demo still calls `Command(resume=…)` after the first invoke; that only applies if the graph actually paused.
 
+**MCP** — Cursor loads `.cursor/mcp.json` and spawns `mcp_server.py` over stdio. Ask the agent to resolve a dispute (e.g. T2 with a customer message). Clean cases finish in one `resolve_dispute` call; escalate cases return `awaiting_approval` and need `approve_dispute` with the returned `thread_id`.
+
+To run the server by hand (same interpreter the MCP config uses):
+
+```bash
+.venv/bin/python mcp_server.py
+```
+
 **API** — `POST /classify` is commented out. To serve it again, uncomment the FastAPI route and:
 
 ```bash
@@ -213,13 +232,15 @@ pytest -v
 
 ## Layout
 
-| File | Role |
-|---|---|
-| `disputedesk.py` | Models, pgvector retrieve, fraud z-score, Claude draft, critic, HITL interrupt/submit, LangGraph |
-| `anthropic_api_call.py` | Anthropic client (`ANTHROPIC_API_KEY` from `.env`) |
-| `run` | Wrapper that always uses `.venv/bin/python` |
-| `test_disputedesk.py` | Pytest for `recommend_action` (v1) |
-| `conftest.py` | Fails fast if pytest is run on Python &lt; 3.11 |
+| File                    | Role                                                                                             |
+| ----------------------- | ------------------------------------------------------------------------------------------------ |
+| `disputedesk.py`        | Models, pgvector retrieve, fraud z-score, Claude draft, critic, HITL interrupt/submit, LangGraph |
+| `mcp_server.py`         | MCP stdio server: `resolve_dispute` / `approve_dispute` wrap `app_graph`                         |
+| `.cursor/mcp.json`      | Cursor MCP config (absolute `.venv/bin/python` + `mcp_server.py`)                                |
+| `anthropic_api_call.py` | Anthropic client (`ANTHROPIC_API_KEY` from `.env`)                                               |
+| `run`                   | Wrapper that always uses `.venv/bin/python`                                                      |
+| `test_disputedesk.py`   | Pytest for `recommend_action` (v1)                                                               |
+| `conftest.py`           | Fails fast if pytest is run on Python &lt; 3.11                                                  |
 
 ## Version history
 
@@ -252,3 +273,5 @@ pytest -v
 **v3.5** — Durable audit trail. `log_decision` inserts one `audit_log` row per node (retrieve, fraud, draft, critic, await_approval, submit) keyed by `thread_id` + `transaction_id`.
 
 **v3.6** — Conditional HITL. `route_after_critic` sends escalate cases to `await_approval` and clean cases straight to `submit`. `submit_node` records `approval_source` as `auto`, `human`, or `human_rejected`.
+
+**v4** — MCP server. `mcp_server.py` (`MCPServer`, stdio) exposes `resolve_dispute` and `approve_dispute` over the same `app_graph`. Cursor config is `.cursor/mcp.json` using `.venv/bin/python` so the GUI spawn does not depend on `uv` being on PATH. (v4 complete.)

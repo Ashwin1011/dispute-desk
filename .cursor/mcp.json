@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "disputedesk": {
+      "command": "/Users/ashwinsingh/Documents/Ashwin/Projects/dispute-desk/.venv/bin/python",
+      "args": ["/Users/ashwinsingh/Documents/Ashwin/Projects/dispute-desk/mcp_server.py"]
+    }
+  }
+}

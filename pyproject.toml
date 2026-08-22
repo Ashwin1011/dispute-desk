@@ -12,6 +12,7 @@ dependencies = [
     "anthropic",
     "fastapi",
     "langgraph",
+    "mcp[cli]>=2.0.0",
     "pgvector",
     "psycopg2-binary",
     "pydantic",
@@ -29,7 +30,7 @@ dev = [
 disputedesk = "disputedesk:main"
 
 [tool.setuptools]
-py-modules = ["disputedesk", "anthropic_api_call"]
+py-modules = ["disputedesk", "anthropic_api_call", "mcp_server"]
 
 [tool.pytest.ini_options]
 testpaths = ["."]
