@@ -1,12 +1,12 @@
 # DisputeDesk
 
-A payment-dispute / chargeback copilot. A LangGraph pipeline retrieves evidence for a transaction, scores a simple fraud signal, asks Claude to classify the complaint and draft a reply that cites the evidence, a critic checks that the draft is grounded, then a human must approve before the reply is “submitted.”
+A payment-dispute / chargeback copilot. A LangGraph pipeline retrieves evidence for a transaction, scores a simple fraud signal, asks Claude to classify the complaint and draft a reply that cites the evidence, and a critic checks that the draft is grounded. A human is asked to approve **only when** the critic escalates; otherwise submit is automatic.
 
-**Current milestone: v3.5.** Human-in-the-loop (v3.4) plus a Postgres `audit_log` row per graph node.
+**Current milestone: v3.6.** Conditional HITL: `critic` → `await_approval` if `escalate_for_review`, else straight to `submit`.
 
-## What it does (through v3.5)
+## What it does (through v3.6)
 
-`main()` invokes `app_graph` with a customer message and a transaction ID (`T1`–`T4`), then **resumes** with `Command(resume={"approved": True})` after the interrupt. Shared state is `DisputeState`:
+`main()` invokes `app_graph` with a customer message and transaction **T2**. If the critic escalates, the run **pauses** and `main()` resumes with `Command(resume={"approved": True})`. If it does not escalate, the first `invoke` finishes through `submit` (auto-approved) and there is nothing to resume. Shared state is `DisputeState`:
 
 | Field | Set by | Meaning |
 |---|---|---|
@@ -22,11 +22,11 @@ A payment-dispute / chargeback copilot. A LangGraph pipeline retrieves evidence 
 Graph:
 
 ```
-START ──► retrieve ──► draft ──► critic ──► await_approval ──► submit ──► END
-       └► fraud    ──►
+START ──► retrieve ──► draft ──► critic ──┬── (escalate_for_review) ──► await_approval ──► submit ──► END
+       └► fraud    ──►                   └── (else) ─────────────────► submit ──────────► END
 ```
 
-`retrieve` and `fraud` run from `START` in parallel; both must finish before `draft`. After the critic, the graph **pauses** until a human resumes it.
+`retrieve` and `fraud` run from `START` in parallel; both must finish before `draft`. After the critic, `route_after_critic` sends the run to `await_approval` only when `escalate_for_review` is true; otherwise it skips the human and goes to `submit`.
 
 ### Retrieve (`retrieve_node` / v3.2)
 
@@ -68,9 +68,9 @@ Markdown fences around the JSON are stripped (`parse_model_json`). Only Anthropi
 
 `CriticVerdict`: `grounded`, `escalate_for_review`, `notes`.
 
-### Human approval (`await_approval_node` / v3.4)
+### Human approval (`await_approval_node` / v3.4, routed in v3.6)
 
-The graph is compiled with `MemorySaver` and a `thread_id` (`dispute-T1-demo` in `main()`). `await_approval_node` calls LangGraph `interrupt({…})` with the draft text, critic notes, and `escalate_for_review`. The first `invoke` returns in a paused state (`PAUSED` in `main()`).
+Reached **only if** the critic set `escalate_for_review` (fraud anomaly or still-ungrounded draft). The graph is compiled with `MemorySaver` and a `thread_id` (`dispute-T1-demo` in `main()`). `await_approval_node` calls LangGraph `interrupt({…})` with the draft text, critic notes, and `escalate_for_review`. That `invoke` returns paused (`PAUSED` in `main()`).
 
 Resume with:
 
@@ -78,15 +78,18 @@ Resume with:
 app_graph.invoke(Command(resume={"approved": True}), config=config)
 ```
 
-`approved` is stored on state. Without a checkpointer, interrupt/resume cannot continue the same run.
+`approved` is stored on state. Without a checkpointer, interrupt/resume cannot continue the same run. If the critic did not escalate, this node never runs.
 
-### Submit (`submit_node` / v3.4)
+### Submit (`submit_node` / v3.4, auto vs human in v3.6)
 
-If `approved` is true, prints `[SUBMITTED] response for {transaction_id}` and sets `submitted=True`. Otherwise prints `[REJECTED]` and sets `submitted=False`. There is no real PSP/network submit yet — this is the stand-in for “send the reply.”
+- Critic escalated: `submitted` follows the human `approved` flag. Audit `approval_source` is `human` or `human_rejected`.
+- Critic did not escalate: `submitted=True` with `approval_source=auto` (no interrupt).
+
+Prints `[SUBMITTED] … (auto|human)` or `[REJECTED]`. There is no real PSP/network submit yet — this is the stand-in for “send the reply.”
 
 ### Audit log (`log_decision` / v3.5)
 
-Every node writes a JSON decision blob to Postgres `audit_log` (`thread_id`, `transaction_id`, `node_name`, `decision`): retrieve (evidence texts), fraud (z-score), draft (reason + reply), critic (verdict), await_approval (approved), submit (submitted). Use the same `thread_id` as the LangGraph checkpointer (`dispute-T1-demo` in `main()`).
+Every node writes a JSON decision blob to Postgres `audit_log` (`thread_id`, `transaction_id`, `node_name`, `decision`): retrieve (evidence texts), fraud (z-score), draft (reason + reply), critic (verdict), await_approval (approved, if HITL ran), submit (`submitted` + `approval_source`). Use the same `thread_id` as the LangGraph checkpointer (`dispute-T1-demo` in `main()`).
 
 Example table:
 
@@ -186,7 +189,7 @@ Uncomment the seed loop in `main()` once to insert evidence rows, then comment i
 
 ## Run
 
-**CLI** — `main()` runs retrieve ∥ fraud → draft → critic, **pauses** for approval, then resumes with `approved: True` and submit:
+**CLI** — `main()` runs T2: retrieve ∥ fraud → draft → critic, then either auto-submit or pause + resume:
 
 ```bash
 ./run
@@ -194,7 +197,7 @@ Uncomment the seed loop in `main()` once to insert evidence rows, then comment i
 source .venv/bin/activate && python disputedesk.py
 ```
 
-You should see `PAUSED —` then `RESUMED —` (and `[SUBMITTED]` if approval was true).
+T2 is near the fixture mean, so if the draft is grounded there is **no** interrupt (`[SUBMITTED] … (auto)`). T1 (`₹2499`) is the fraud outlier and typically hits HITL. The demo still calls `Command(resume=…)` after the first invoke; that only applies if the graph actually paused.
 
 **API** — `POST /classify` is commented out. To serve it again, uncomment the FastAPI route and:
 
@@ -247,3 +250,5 @@ pytest -v
 **v3.4** — Human-in-the-loop. After critic: `await_approval` (`interrupt` with draft + critic notes), `MemorySaver` checkpointer + `thread_id`, resume via `Command(resume={"approved": True|False})`, then `submit_node` marks the reply submitted or rejected. Demo in `main()` pauses, then auto-resumes with approval.
 
 **v3.5** — Durable audit trail. `log_decision` inserts one `audit_log` row per node (retrieve, fraud, draft, critic, await_approval, submit) keyed by `thread_id` + `transaction_id`.
+
+**v3.6** — Conditional HITL. `route_after_critic` sends escalate cases to `await_approval` and clean cases straight to `submit`. `submit_node` records `approval_source` as `auto`, `human`, or `human_rejected`.

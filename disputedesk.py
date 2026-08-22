@@ -199,6 +199,11 @@ def retrieve_evidence_semantic(query_text: str, transaction_id: str, top_k: int 
     rows = cur.fetchall()
     return [text for text, distance in rows]
 
+def route_after_critic(state: DisputeState) -> str:
+    verdict = state["critic_verdict"]
+    assert verdict is not None, "route_after_critic requires critic_node to run first"
+    return "await_approval" if verdict.escalate_for_review else "submit"
+
 def draft_from_evidence(customer_message: str, evidence: list[str]) -> DraftResponse:
     evidence_block = "\n".join(f"- {e}" for e in evidence) or "No evidence on file."
     prompt = f"""A customer wrote this dispute message:
@@ -248,14 +253,23 @@ def await_approval_node(state: DisputeState, config: RunnableConfig) -> dict:
     return {"approved": approved}
 
 def submit_node(state: DisputeState, config: RunnableConfig) -> dict:
-    submitted = bool(state["approved"])
-    if submitted:
-        print(f"[SUBMITTED] response for {state['transaction_id']}")
-        log_decision(get_thread_id(config), state["transaction_id"], "submit", {"approved": state["approved"], "submitted": True})
-        return {"submitted": True}
-    print(f"[REJECTED] response for {state['transaction_id']} was not approved")
-    log_decision(get_thread_id(config), state["transaction_id"], "submit", {"approved": state["approved"], "submitted": False})
-    return {"submitted": False}
+    verdict = state["critic_verdict"]
+    assert verdict is not None, "submit_node requires critic_node to run first"
+
+    if verdict.escalate_for_review:
+        submitted = bool(state["approved"])
+        approval_source = "human" if submitted else "human_rejected"
+    else:
+        submitted = True
+        approval_source = "auto"
+
+    print(f"[SUBMITTED] response for {state['transaction_id']} ({approval_source})" if submitted
+          else f"[REJECTED] response for {state['transaction_id']} was not approved")
+    log_decision(
+        get_thread_id(config), state["transaction_id"], "submit",
+        {"approved": state["approved"], "submitted": submitted, "approval_source": approval_source},
+    )
+    return {"submitted": submitted}
 
 graph = StateGraph(DisputeState)
 graph.add_node("retrieve",retrieve_node)
@@ -271,7 +285,10 @@ graph.add_edge("retrieve", "draft")
 graph.add_edge("fraud", "draft")
 graph.add_edge("draft", "critic")
 
-graph.add_edge("critic", "await_approval")
+graph.add_conditional_edges("critic", route_after_critic, {
+    "await_approval": "await_approval",
+    "submit": "submit",
+})
 graph.add_edge("await_approval", "submit")
 graph.add_edge("submit", END)
 
@@ -334,6 +351,29 @@ app_graph = graph.compile(checkpointer=checkpointer)
 #     )
 #     return DraftClassification.model_validate_json(parse_model_json(message_text(response)))
 
+
+def run_dispute(customer_message: str, transaction_id: str, thread_id: str) -> dict:
+    config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+    result = app_graph.invoke({
+        "customer_message": customer_message,
+        "transaction_id": transaction_id,
+        "evidence": None,
+        "fraud_flag": None,
+        "draft": None,
+        "critic_verdict": None,
+        "approved": None,
+        "submitted": None,
+    }, config=config)
+
+    if "__interrupt__" in result:
+        print("PAUSED —", result)
+        result = app_graph.invoke(Command(resume={"approved": True}), config=config)
+        print("RESUMED —", result)
+    else:
+        print("COMPLETED (no pause needed) —", result)
+
+    return result
+
 def main():
     # tx_by_id = {t.id: t for t in transactions}
     # for d in disputes:
@@ -354,21 +394,8 @@ def main():
 
     # print(retrieve_evidence_semantic("the customer says their package never arrived"))
 
-    config: RunnableConfig = {"configurable": {"thread_id": "dispute-T1-demo"}}
-
-    result = app_graph.invoke({
-    "customer_message": "I have a duplicate charge on my card, I never ordered anything.",
-    "transaction_id": "T1",
-    "evidence": None,
-    "fraud_flag": None,
-    "draft": None,
-    "critic_verdict": None,
-    "approved": None,
-    "submitted": None,
-    },config=config)
-    print("PAUSED —", result)
-    result = app_graph.invoke(Command(resume={"approved": True}), config=config)
-    print("RESUMED —", result)
+    run_dispute("I have a duplicate charge on my card, I never ordered anything.", "T1", "dispute-T1-demo")
+    run_dispute("I have a duplicate charge on my card, I never ordered anything.", "T2", "dispute-T2-demo")
 
 
 if __name__ == "__main__":
