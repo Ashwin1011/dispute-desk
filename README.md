@@ -2,13 +2,15 @@
 
 A payment-dispute / chargeback copilot. A LangGraph pipeline retrieves evidence for a transaction, scores a simple fraud signal, asks Claude to classify the complaint and draft a reply that cites the evidence, and a critic checks that the draft is grounded. A human is asked to approve **only when** the critic escalates; otherwise submit is automatic. The same graph is exposed as an MCP server so Cursor (or any MCP client) can run and approve disputes as tools.
 
-Evidence, fraud scoring, and MCP calls are **scoped to a tenant**. A tenant cannot retrieve another tenant’s evidence or score fraud on another tenant’s transactions.
+Evidence, fraud scoring, and MCP calls are **scoped to a tenant**. A tenant cannot retrieve another tenant's evidence or score fraud on another tenant's transactions.
 
-**Current milestone: v5 complete.** Multi-tenant isolation on retrieve, fraud, MCP (`tenant_id`), and permission-boundary tests.
+**Current milestone:** the full `retrieve ∥ fraud → draft → critic → conditional HITL → submit → audit-log` pipeline is built, checkpointed, and shipped as an MCP server — verified live from Cursor, including a real human-rejection path. Retrieval and fraud checking are now tenant-scoped, backed by a 9/9-passing automated cross-tenant test suite. See *Known limitations* and *What's next* below before treating any part of this as finished.
+
+> **Note on version numbers below:** the `v0`–`v5.x` tags in this file are this project's own chronological build order, not the phase numbers from the project's planning docs. There, `v4` names the whole multi-agent + MCP milestone, and `v5` names a golden-dataset eval + CI-gated regression + formal red-team suite that **has not been started**. What this file calls `v5` (tenant isolation) is really closing a permission-boundary gap the original plan scoped under `v3`. Flagging this so the two don't read as contradictory.
 
 ## What it does (through v5)
 
-`main()` invokes `app_graph` with a customer message, tenant **electromart**, and transaction **T1**. If the critic escalates, the run **pauses** and `main()` resumes with `Command(resume={"approved": True})`. If it does not escalate, the first `invoke` finishes through `submit` (auto-approved) and there is nothing to resume. Shared state is `DisputeState`:
+`main()` invokes `app_graph` with a customer message, a tenant, and a transaction. If the critic escalates, the run **pauses** and `main()` resumes with `Command(resume={"approved": True})`. If it does not escalate, the first `invoke` finishes through `submit` (auto-approved) and there is nothing to resume. Shared state is `DisputeState`:
 
 | Field              | Set by                                | Meaning                               |
 | ------------------ | ------------------------------------- | ------------------------------------- |
@@ -16,7 +18,7 @@ Evidence, fraud scoring, and MCP calls are **scoped to a tenant**. A tenant cann
 | `tenant_id`        | input                                 | Which merchant owns the order         |
 | `transaction_id`   | input                                 | Which order to look up (`T1` …)       |
 | `evidence`         | `retrieve`                            | Top-k evidence strings from Postgres  |
-| `fraud_flag`       | `fraud`                               | Amount z-score vs that tenant’s txs   |
+| `fraud_flag`       | `fraud`                               | Amount z-score vs that tenant's txs   |
 | `draft`            | `draft` (maybe rewritten by `critic`) | Reason, citations, reply, confidence  |
 | `critic_verdict`   | `critic`                              | Grounded? Escalate? Notes             |
 | `approved`         | `await_approval`                      | Human yes/no from `Command(resume=…)` |
@@ -39,11 +41,11 @@ START ──► retrieve ──► draft ──► critic ──┬── (escal
 2. Queries Postgres `evidence` with pgvector cosine distance (`<=>`), **filtered to that `tenant_id` and `transaction_id`**.
 3. Returns the closest `top_k` texts. A wrong tenant gets an empty list (no cross-tenant leakage).
 
-Earlier (v2.7) this was in-memory “grab every `EvidenceItem` for this ID” with no embeddings. That helper is commented out.
+Earlier (v2.7) this was in-memory "grab every `EvidenceItem` for this ID" with no embeddings. That helper is commented out.
 
 ### Fraud (`fraud_node` / v3.3, tenant-scoped in v5)
 
-`check_fraud_signals(tenant_id, transaction_id)` looks up the fixture `Transaction` **among that tenant’s rows only** and computes a z-score of its `amount` against that tenant’s amounts (`statistics.mean` / `pstdev`). If the id is missing for that tenant, it returns `note="transaction not found for this tenant"` and does not score another merchant’s order.
+`check_fraud_signals(tenant_id, transaction_id)` looks up the fixture `Transaction` **among that tenant's rows only** and computes a z-score of its `amount` against that tenant's amounts (`statistics.mean` / `pstdev`). If the id is missing for that tenant, it returns `note="transaction not found for this tenant"` and does not score another merchant's order.
 
 If `|z| > 1.5`, `is_anomaly` is true and the note says the amount is flagged for review.
 
@@ -57,6 +59,8 @@ Fixtures:
 | T4 | subscribebox  | ₹800   |
 
 Output is `FraudFlag(z_score, is_anomaly, note)`.
+
+**Worth knowing:** before tenant scoping, T1's amount looked anomalous because it was being compared against *every* tenant's transactions combined, including subscribebox's much smaller ones. Scoping the z-score to electromart alone was the correct fix — but with exactly two transactions per tenant, it also means `|z|` is now mathematically always exactly `1.0` for either transaction in a tenant (the z-score of either point in a 2-point population is always `±1`, regardless of the actual amounts), so `is_anomaly` currently can never fire from amount alone. See *Known limitations*.
 
 ### Draft (`draft_node` / v3–v3.2)
 
@@ -82,6 +86,8 @@ Markdown fences around the JSON are stripped (`parse_model_json`). Only Anthropi
 
 `CriticVerdict`: `grounded`, `escalate_for_review`, `notes`.
 
+Given the fraud-anomaly path currently can't fire (see above), the grounding-failure path is, for now, the only way `escalate_for_review` actually triggers in this fixture set — confirmed by requesting a cross-tenant transaction: `evidence` comes back empty, the draft cites nothing real, `grounded=False`, and the critic escalates on its own, independent of the fraud flag. Two separate safety nets, both real.
+
 ### Human approval (`await_approval_node` / v3.4, routed in v3.6)
 
 Reached **only if** the critic set `escalate_for_review` (fraud anomaly or still-ungrounded draft). The graph is compiled with `MemorySaver` and a `thread_id` (`dispute-T1-demo` in `main()`; MCP uses `dispute-{tenant_id}-{transaction_id}`). `await_approval_node` calls LangGraph `interrupt({…})` with the draft text, critic notes, and `escalate_for_review`. That `invoke` returns paused (`PAUSED` in `main()`).
@@ -99,7 +105,7 @@ app_graph.invoke(Command(resume={"approved": True}), config=config)
 - Critic escalated: `submitted` follows the human `approved` flag. Audit `approval_source` is `human` or `human_rejected`.
 - Critic did not escalate: `submitted=True` with `approval_source=auto` (no interrupt).
 
-Prints `[SUBMITTED] … (auto|human)` or `[REJECTED]`. There is no real PSP/network submit yet — this is the stand-in for “send the reply.”
+Prints `[SUBMITTED] … (auto|human)` or `[REJECTED]`. There is no real PSP/network submit yet — this is the stand-in for "send the reply."
 
 ### Audit log (`log_decision` / v3.5)
 
@@ -127,9 +133,9 @@ CREATE TABLE IF NOT EXISTS audit_log (
 | `resolve_dispute` | `tenant_id`, `transaction_id`, `customer_message` | `invoke` with `thread_id=dispute-{tenant_id}-{transaction_id}`. If the graph interrupts, returns `status=awaiting_approval` plus `draft_text` / `critic_notes`. Otherwise `submitted` or `rejected`.   |
 | `approve_dispute` | `thread_id`, `approved`                        | `Command(resume={"approved": …})` on that thread. Returns `submitted` or `rejected` and the draft text.                                                                                                   |
 
-Example: resolve T1 for tenant `electromart` with `"I never received this order."` Clean cases finish in one `resolve_dispute` call; escalate cases return `awaiting_approval` and need `approve_dispute` with the returned `thread_id`.
+Example: resolve T1 for tenant `electromart` with `"I never received this order."` Clean cases finish in one `resolve_dispute` call; escalate cases return `awaiting_approval` and need `approve_dispute` with the returned `thread_id`. A request naming a tenant that doesn't own the transaction (e.g. tenant `subscribebox` with `transaction_id=T1`) correctly returns no evidence and escalates via the grounding check — verified live, not just in tests.
 
-Cursor is configured in `.cursor/mcp.json`. The command is this project’s **`.venv/bin/python`** with an absolute path to `mcp_server.py` — not bare `uv` / `python`. Cursor’s GUI process does not inherit the shell PATH, so `spawn uv ENOENT` is what you get if the command is just `uv`.
+Cursor is configured in `.cursor/mcp.json`. The command is this project's **`.venv/bin/python`** with an absolute path to `mcp_server.py` — not bare `uv` / `python`. Cursor's GUI process does not inherit the shell PATH, so `spawn uv ENOENT` is what you get if the command is just `uv`, and `ECONNREFUSED ::1:8000` is what you get if the config accidentally points at an SSE/URL transport instead of a local stdio command.
 
 ### Reason codes
 
@@ -146,9 +152,24 @@ v1 `recommend_action` (contest / accept / needs_review from delivery flags) and 
 
 Fixture transactions T1–T4 remain in memory (each with a `tenant_id`). Evidence embeddings live in Postgres after a one-time seed (`uv run python seed_evidence.py`).
 
+## Known limitations
+
+Named here on purpose rather than left implicit — these are the honest edges of what's built so far, not things papered over:
+
+- **The fraud-anomaly escalation path can't currently fire.** With exactly two transactions per tenant, `check_fraud_signals`'s z-score is mathematically always `±1.0` (true for any 2-point population regardless of the actual amounts), which never crosses the `1.5` threshold. `is_anomaly` is real code, correctly scoped, but currently unreachable by the fixture data. A third transaction per tenant with a genuine outlier amount would restore a meaningful demo of that path — not done yet.
+- **`MemorySaver` is dev-only.** It doesn't survive a process restart, so an interrupted dispute can't currently be approved in a separate run from the one that started it — only within one live Python process. A persistent checkpointer (SQLite- or Postgres-backed) is a small, well-understood swap for later, not built yet.
+- **LangGraph logs a deserialization warning** for the custom Pydantic types (`FraudFlag`, `DraftResponse`, `CriticVerdict`) stored in checkpoints — a real, forward-looking security signal (LangGraph is moving toward blocking arbitrary-class deserialization from checkpoints by default). Deferred; the clean fix is storing `.model_dump()` dicts in state instead of raw model instances, not whitelisting class names.
+- **`audit_log` has a narrow theoretical race.** `retrieve` and `fraud` run in parallel and both write to `audit_log` through the same shared `conn` (each opens its own cursor, which mitigates but doesn't fully eliminate risk under a truly concurrent executor). Worth a connection pool before this is anything more than a demo.
+- **No customer-level fraud memory.** `FraudAnalyst` only looks at one transaction's amount, tenant-scoped — it has no notion of "this customer has filed three disputes this month," which is itself a real fraud signal. Not built.
+- **Data is entirely synthetic**, by design — four fixture transactions, three evidence rows, two tenants. Good enough to prove the architecture; not a claim about handling real volume or variety.
+
+## What's next
+
+Per the original build plan: hybrid search (Postgres full-text + pgvector, since evidence contains both exact identifiers like tracking numbers and paraphrased complaint text that call for different retrieval strategies) and a documented Weaviate comparison experiment, now that they'd sit on top of a properly tenant-scoped retriever instead of a leaky one. After that: Tavily for looking up current dispute policy externally, then the project's actual `v5` — a golden-dataset eval, CI-gated regression, and a formal red-team suite (the permission-boundary tests above are a first real piece of that, worth folding in rather than rebuilding) — and `v6`, production deployment with monitoring and a maintenance runbook.
+
 ## Python environment (`.venv`)
 
-This machine has several Pythons: pyenv’s global **2.7**, a system **python3**, and this project’s **`.venv`**. Packages like `langgraph` live only in `.venv`. Bare `python disputedesk.py` uses pyenv, not the venv, which is why you see `ModuleNotFoundError`.
+This machine has several Pythons: pyenv's global **2.7**, a system **python3**, and this project's **`.venv`**. Packages like `langgraph` live only in `.venv`. Bare `python disputedesk.py` uses pyenv, not the venv, which is why you see `ModuleNotFoundError`.
 
 The same trap hits tests: bare `pytest` (or `uv run pytest` **before** pytest is in the project env) can pick up `/Library/Frameworks/Python.framework/.../python3`, which does not have `langgraph`. Always run tests with `uv run pytest` after `uv sync`, so pytest is `.venv/bin/pytest`.
 
@@ -244,7 +265,7 @@ uv run python disputedesk.py
 source .venv/bin/activate && python disputedesk.py
 ```
 
-T1 (`₹2499`) is the large electromart amount and typically hits HITL. T2 is nearer that tenant’s mean; if the draft is grounded there is **no** interrupt (`[SUBMITTED] … (auto)`). The demo still calls `Command(resume=…)` after the first invoke; that only applies if the graph actually paused.
+With the current fixture data, T1 and T2 (electromart) and T3 and T4 (subscribebox) all draft and auto-submit without pausing — the fraud-anomaly path can't fire yet (see *Known limitations*). To actually see a pause + `Command(resume=…)` cycle right now, request a transaction under the *wrong* tenant (e.g. tenant `subscribebox`, transaction `T1`): retrieval correctly comes back empty, the draft can't ground itself, and the critic escalates. The demo still calls `Command(resume=…)` after the first invoke; that only actually does something if the graph paused — resuming an already-completed thread is a safe no-op.
 
 **MCP** — Cursor loads `.cursor/mcp.json` and spawns `mcp_server.py` over stdio. Ask the agent to resolve a dispute for a tenant (e.g. electromart T1 with `"I never received this order."`). Clean cases finish in one `resolve_dispute` call; escalate cases return `awaiting_approval` and need `approve_dispute` with the returned `thread_id`.
 
@@ -265,6 +286,8 @@ uv run uvicorn disputedesk:app --reload
 ```bash
 uv run pytest tests/test_permission_boundary.py -v
 ```
+
+9 cases: every transaction tried against every tenant that doesn't own it (retrieval + fraud check both), plus one positive sanity check proving the boundary blocks wrong tenants without blocking everyone.
 
 `tests/test_disputedesk.py` still imports v1 `recommend_action` (commented out) and is not part of the live path.
 
@@ -314,6 +337,6 @@ uv run pytest tests/test_permission_boundary.py -v
 
 **v3.6** — Conditional HITL. `route_after_critic` sends escalate cases to `await_approval` and clean cases straight to `submit`. `submit_node` records `approval_source` as `auto`, `human`, or `human_rejected`.
 
-**v4** — MCP server. `mcp_server.py` (`MCPServer`, stdio) exposes `resolve_dispute` and `approve_dispute` over the same `app_graph`. Cursor config is `.cursor/mcp.json` using `.venv/bin/python` so the GUI spawn does not depend on `uv` being on PATH. (v4 complete.)
+**v4** — MCP server. `mcp_server.py` (`MCPServer`, stdio) exposes `resolve_dispute` and `approve_dispute` over the same `app_graph`. Cursor config is `.cursor/mcp.json` using `.venv/bin/python` so the GUI spawn does not depend on `uv` being on PATH. Verified live from Cursor's Agent chat, including a real human-rejection path. (v4 complete.)
 
-**v5** — Multi-tenant isolation. `tenant_id` on `Transaction`, `EvidenceItem`, `DisputeState`, Postgres `evidence`, retrieve (`WHERE tenant_id AND transaction_id`), and fraud (z-score against that tenant’s amounts only; unknown pair → `"transaction not found for this tenant"`). MCP `resolve_dispute` takes `tenant_id`; thread ids are `dispute-{tenant_id}-{transaction_id}`. Seed via `seed_evidence.py`. Permission-boundary tests in `tests/test_permission_boundary.py`. Run tests with `uv run pytest` so pytest uses `.venv`, not system Python. (v5 complete.)
+**v5** — Multi-tenant isolation, closing a permission-boundary gap from the original `v3` spec rather than the roadmap's actual `v5` (see the note at the top of this file). `tenant_id` on `Transaction`, `EvidenceItem`, `DisputeState`, Postgres `evidence`, retrieve (`WHERE tenant_id AND transaction_id`), and fraud (z-score against that tenant's amounts only; unknown pair → `"transaction not found for this tenant"`). MCP `resolve_dispute` takes `tenant_id`; thread ids are `dispute-{tenant_id}-{transaction_id}`. Seed via `seed_evidence.py`. Found and fixed a real bug this exposed: pre-fix, the fraud z-score was computed across all tenants combined, which was both a soft data leak and statistically wrong — fixing it changed T1's fraud verdict from anomalous to normal. Permission-boundary tests in `tests/test_permission_boundary.py` (9/9 passing: every transaction against every tenant that doesn't own it, plus a positive sanity check). Run tests with `uv run pytest` so pytest uses `.venv`, not system Python. (v5, as scoped here, complete — see *Known limitations* and *What's next* for what the roadmap's real v5/v6 still require.)
