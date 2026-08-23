@@ -15,6 +15,12 @@ from anthropic.types import Message, TextBlock
 from fastapi import FastAPI
 import statistics
 import json
+import weaviate
+from weaviate.classes.config import Configure, DataType, Property
+from weaviate.classes.query import Filter
+import time
+
+weaviate_client = weaviate.connect_to_local()
 app = FastAPI()
 
 embedder = SentenceTransformer("all-MiniLM-L6-v2")
@@ -241,6 +247,25 @@ def retrieve_evidence_hybrid(query_text: str, tenant_id: str, transaction_id: st
     ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
     return [text for text, _ in ranked[:top_k]]
 
+def retrieve_evidence_weaviate(query_text: str, tenant_id: str, transaction_id: str, top_k: int = 2) -> list[str]:
+    query_vector = embedder.encode(query_text).tolist()
+    evidence_collection = weaviate_client.collections.get("Evidence")
+    response = evidence_collection.query.near_vector(
+        near_vector=query_vector,
+        filters=(
+            Filter.by_property("tenant_id").equal(tenant_id)
+            & Filter.by_property("transaction_id").equal(transaction_id)
+        ),
+        limit=top_k,
+    )
+    texts: list[str] = []
+    for obj in response.objects:
+        text = obj.properties["text"]
+        if isinstance(text, str):
+            texts.append(text)
+    return texts
+
+
 def route_after_critic(state: DisputeState) -> str:
     verdict = state["critic_verdict"]
     assert verdict is not None, "route_after_critic requires critic_node to run first"
@@ -413,6 +438,23 @@ def run_dispute(customer_message: str, tenant_id: str, transaction_id: str, thre
 
     return result
 
+def benchmark(fn, *args, n=20, **kwargs):
+    fn(*args, **kwargs)  # warm-up call, not counted — excludes first-call connection setup
+    times = []
+    for _ in range(n):
+        start = time.perf_counter()
+        fn(*args, **kwargs)
+        times.append(time.perf_counter() - start)
+    times.sort()
+    return {
+        "mean_ms": round(sum(times) / len(times) * 1000, 2),
+        "median_ms": round(times[len(times) // 2] * 1000, 2),
+        "min_ms": round(times[0] * 1000, 2),
+        "max_ms": round(times[-1] * 1000, 2),
+    }
+
+
+
 def main():
     # tx_by_id = {t.id: t for t in transactions}
     # for d in disputes:
@@ -434,9 +476,14 @@ def main():
     # print(retrieve_evidence_semantic("the customer says their package never arrived"))
 
     # run_dispute("I have a duplicate charge on my card, I never ordered anything.", "electromart", "T1", "dispute-T1-demo")
-    print("hybrid:", retrieve_evidence_hybrid("what about tracking TRK556", "electromart", "T1", top_k=2))
+    # print("hybrid:", retrieve_evidence_hybrid("what about tracking TRK556", "electromart", "T1", top_k=2))
     # run_dispute("I have a duplicate charge on my card, I never ordered anything.", "T2", "dispute-T2-demo")
-
+    # print("pgvector:", retrieve_evidence_semantic("what about tracking TRK556", "electromart", "T1", top_k=2))
+    # print("weaviate:", retrieve_evidence_weaviate("what about tracking TRK556", "electromart", "T1", top_k=2))
+    print("pgvector:", benchmark(retrieve_evidence_semantic, "what about tracking TRK556", "electromart", "T1", top_k=2));
+    print("weaviate:", benchmark(retrieve_evidence_weaviate, "what about tracking TRK556", "electromart", "T1", top_k=2));
+    weaviate_client.close()
+    conn.close()
 
 if __name__ == "__main__":
     main()

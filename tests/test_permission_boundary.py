@@ -2,6 +2,7 @@ import pytest
 from disputedesk import (
     retrieve_evidence_semantic, retrieve_evidence_keyword, retrieve_evidence_hybrid,
     check_fraud_signals, transactions, evidence_items,
+    retrieve_evidence_weaviate,
 )
 
 ALL_TENANTS = sorted({t.tenant_id for t in transactions})
@@ -74,3 +75,16 @@ def test_retrieve_evidence_keyword_works_for_correct_tenant():
 def test_retrieve_evidence_hybrid_works_for_correct_tenant():
     evidence = retrieve_evidence_hybrid("tracking TRK556", "electromart", "T1", top_k=2)
     assert len(evidence) > 0
+
+def test_retrieve_evidence_weaviate_works_for_correct_tenant():
+    evidence = retrieve_evidence_weaviate("tracking TRK556", "electromart", "T1", top_k=2)
+    assert len(evidence) > 0
+
+
+@pytest.mark.parametrize("transaction_id,wrong_tenant_id", list(wrong_tenant_pairs()))
+def test_retrieve_evidence_weaviate_blocks_cross_tenant_access(transaction_id, wrong_tenant_id):
+    query = first_evidence_text(transaction_id)
+    evidence = retrieve_evidence_weaviate(query, wrong_tenant_id, transaction_id, top_k=5)
+    assert evidence == [], (
+        f"tenant '{wrong_tenant_id}' retrieved evidence for transaction '{transaction_id}' via weaviate"
+    )

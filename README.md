@@ -4,7 +4,7 @@ A payment-dispute / chargeback copilot. A LangGraph pipeline retrieves evidence 
 
 Evidence, fraud scoring, and MCP calls are **scoped to a tenant**. A tenant cannot retrieve another tenant's evidence or score fraud on another tenant's transactions.
 
-**Current milestone:** the full `retrieve ∥ fraud → draft → critic → conditional HITL → submit → audit-log` pipeline is built, checkpointed, and shipped as an MCP server — verified live from Cursor, including a real human-rejection path. Retrieval and fraud checking are tenant-scoped, and retrieval is now **hybrid** (Postgres full-text keyword search fused with pgvector semantic search via Reciprocal Rank Fusion) rather than semantic-only — all three retrieval methods, plus fraud checking, are covered by a 19/19-passing automated cross-tenant test suite. See *Known limitations* and *What's next* below before treating any part of this as finished.
+**Current milestone:** the full `retrieve ∥ fraud → draft → critic → conditional HITL → submit → audit-log` pipeline is built, checkpointed, and shipped as an MCP server — verified live from Cursor, including a real human-rejection path. Retrieval and fraud checking are tenant-scoped, retrieval is **hybrid** (Postgres full-text keyword search fused with pgvector semantic search via Reciprocal Rank Fusion), and a fourth retrieval path (Weaviate, run locally via Docker, seeded with identical embeddings) has been measured against pgvector as a documented comparison experiment — not adopted, pgvector remains the live path. All four retrieval methods, plus fraud checking, are covered by a 24/24-passing automated cross-tenant test suite. See *Known limitations* and *What's next* below before treating any part of this as finished.
 
 > **Note on version numbers below:** the `v0`–`v5.x` tags in this file are this project's own chronological build order, not the phase numbers from the project's planning docs. There, `v4` names the whole multi-agent + MCP milestone, and `v5` names a golden-dataset eval + CI-gated regression + formal red-team suite that **has not been started**. What this file calls `v5` (tenant isolation) is really closing a permission-boundary gap the original plan scoped under `v3`. Flagging this so the two don't read as contradictory.
 
@@ -48,6 +48,23 @@ START ──► retrieve ──► draft ──► critic ──┬── (escal
 **Deliberately not BM25.** Postgres's built-in `ts_rank` predates BM25 and lacks its two key improvements — term-frequency saturation and document-length normalization — both of which matter most for large, variable-length document collections. DisputeDesk's evidence is uniformly short, single-sentence snippets, where those advantages are largely theoretical rather than practical. Documented as a reasoned trade-off, not an oversight: if evidence documents ever grow longer and more variable (full email threads, multi-paragraph tickets), the concrete next move is the ParadeDB `pg_search` Postgres extension (real BM25 via Tantivy, no new infrastructure to run) or a dedicated search engine — not needed for the data this project actually has today.
 
 Earlier (v2.7) retrieval was in-memory "grab every `EvidenceItem` for this ID" with no embeddings. That helper is commented out.
+
+### Weaviate comparison (`retrieve_evidence_weaviate` / v5.2)
+
+A documented comparison experiment, not a replacement — `retrieve_node` still calls `retrieve_evidence_hybrid`; pgvector stays the live retrieval backend. Weaviate runs locally via Docker (see *Setup*), with its auto-vectorizer modules disabled entirely (`ENABLE_MODULES: ''`, collection created with `Configure.Vectors.self_provided()`) so it's seeded with the *exact same* MiniLM embeddings pgvector gets, from one shared loop over `evidence_items` in `seed_evidence.py`. That's deliberate: it isolates the variable actually being measured to "which database searches vectors better," not "which embedding model is better." `retrieve_evidence_weaviate(query, tenant_id, transaction_id, top_k)` mirrors `retrieve_evidence_semantic`'s signature exactly — `near_vector` search filtered by `Filter.by_property("tenant_id").equal(tenant_id) & Filter.by_property("transaction_id").equal(transaction_id)`, Weaviate's equivalent of the SQL `WHERE` clause, same tenant-scoping discipline as every other retrieval path.
+
+**Finding 1 — ranking came back identical, and that's the correct result, not a failed comparison.** Same query, same embeddings, same 3-candidate evidence set for T1: pgvector and Weaviate returned the same two results in the same order. At this data scale there's no room for the two systems' internal approximate-nearest-neighbor indexing to diverge — that only becomes possible at a scale (thousands+ of vectors) this fixture set doesn't have.
+
+**Finding 2 — a real, measured latency difference, with the honest caveat attached.** 20 repeated calls each, one untimed warm-up call excluded to avoid counting first-call connection setup:
+
+| | mean | median | min | max |
+|---|---|---|---|---|
+| pgvector | 10.75 ms | 10.55 ms | 8.83 ms | 13.22 ms |
+| Weaviate | 12.14 ms | 12.21 ms | 10.72 ms | 13.54 ms |
+
+pgvector is consistently faster by roughly 1.4 ms (~13%) — real and reproducible, not noise (the ranges barely overlap). The honest interpretation is narrower than "pgvector's search is faster," though: at 6 total evidence rows, the nearest-neighbor computation itself is instantaneous on either side — what's actually being measured is almost entirely each client library's connection/serialization overhead (`psycopg2`'s native binary protocol vs. Weaviate's HTTP/gRPC client), not indexing efficiency. A comparison that actually stress-tests indexing strategy would need a dataset several orders of magnitude larger than this project has. Both numbers are also small enough in absolute terms to be irrelevant next to the multi-second Claude API call already happening in `draft_node` — neither would be a real bottleneck here.
+
+**Verified tenant-isolated too, not just measured.** `retrieve_evidence_weaviate` has its own filter implementation, separate from the SQL-based ones — covered in `tests/test_permission_boundary.py` the same way as every other retrieval method.
 
 ### Fraud (`fraud_node` / v3.3, tenant-scoped in v5)
 
@@ -171,7 +188,7 @@ Named here on purpose rather than left implicit — these are the honest edges o
 
 ## What's next
 
-Per the original build plan: hybrid search (Postgres full-text + pgvector) is **done** — `retrieve_node` now calls `retrieve_evidence_hybrid`, verified against a real keyword-vs-semantic divergence rather than just described. Still pending from that same phase: a documented **Weaviate comparison experiment** (same evidence, measured retrieval quality/latency against the current pgvector + Postgres-full-text setup — a genuine "did switching vector stores help, and by how much" writeup, not a replacement). After that: Tavily for looking up current dispute policy externally, then the project's actual `v5` — a golden-dataset eval, CI-gated regression, and a formal red-team suite (the permission-boundary tests above are a first real piece of that, worth folding in rather than rebuilding) — and `v6`, production deployment with monitoring and a maintenance runbook.
+Per the original build plan: hybrid search (Postgres full-text + pgvector) and the **Weaviate comparison experiment** are both **done** — see the *Retrieve* and *Weaviate comparison* sections above for what was actually measured (identical ranking at this scale, a real ~13% latency gap attributable mostly to client-protocol overhead, not indexing quality) rather than just described. Next: Tavily, for looking up current card-network dispute policy externally instead of hardcoding rules that go stale. After that: the project's actual `v5` — a golden-dataset eval, CI-gated regression, and a formal red-team suite (the permission-boundary tests above, now 24 cases across four retrieval methods, are a first real piece of that, worth folding in rather than rebuilding) — and `v6`, production deployment with monitoring and a maintenance runbook.
 
 ## Python environment (`.venv`)
 
@@ -259,6 +276,42 @@ Seed evidence once (do not re-run without clearing rows, or you will duplicate t
 uv run python seed_evidence.py
 ```
 
+**Weaviate** (for the retrieval comparison experiment only — not required for the main pipeline) runs locally via Docker. Create `docker-compose.yml` in the project root:
+
+```yaml
+services:
+  weaviate:
+    command:
+      - --host
+      - 0.0.0.0
+      - --port
+      - '8080'
+      - --scheme
+      - http
+    image: cr.weaviate.io/semitechnologies/weaviate:1.39.0
+    ports:
+      - "8080:8080"
+      - "50051:50051"
+    volumes:
+      - weaviate_data:/var/lib/weaviate
+    restart: on-failure:0
+    environment:
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: 'true'
+      PERSISTENCE_DATA_PATH: '/var/lib/weaviate'
+      ENABLE_MODULES: ''
+      CLUSTER_HOSTNAME: 'node1'
+
+volumes:
+  weaviate_data:
+```
+
+```bash
+docker-compose up -d
+curl http://localhost:8080/v1/.well-known/ready   # empty 200 OK means it's up
+```
+
+`uv add weaviate-client` adds the Python client. `seed_evidence.py` (above) seeds both Postgres and Weaviate from the same `evidence_items` list in one run — rerunning it recreates the Weaviate `Evidence` collection cleanly (`collections.delete` before `collections.create`), the same "reseed rather than patch" approach as the Postgres `TRUNCATE`.
+
 ## Run
 
 **CLI** — `main()` runs electromart T1: retrieve ∥ fraud → draft → critic, then either auto-submit or pause + resume:
@@ -293,7 +346,7 @@ uv run uvicorn disputedesk:app --reload
 uv run pytest tests/test_permission_boundary.py -v
 ```
 
-19 cases: every transaction tried against every tenant that doesn't own it, across all three retrieval methods (semantic, keyword, hybrid) plus the fraud check, plus five positive sanity checks proving the boundary blocks wrong tenants without blocking everyone. The keyword/hybrid cross-tenant cases deliberately build their attack query from the target transaction's own evidence text — a generic query would return empty regardless of whether the tenant boundary works at all (keyword search's hard match gate means "no shared words" and "correctly blocked" look identical), so the test needs a query that *would* match if the boundary were actually broken. Extending past semantic-only search this way caught a real, if minor, gap: T4 had a `Transaction` fixture but no matching `EvidenceItem` at all, which crashed the test before it even reached the boundary logic — closed by adding T4's missing evidence rather than working around the test.
+24 cases: every transaction tried against every tenant that doesn't own it, across all four retrieval methods (semantic, keyword, hybrid, Weaviate) plus the fraud check, plus six positive sanity checks proving the boundary blocks wrong tenants without blocking everyone. The keyword/hybrid/Weaviate cross-tenant cases deliberately build their attack query from the target transaction's own evidence text — a generic query would return empty regardless of whether the tenant boundary works at all (keyword search's hard match gate especially means "no shared words" and "correctly blocked" look identical), so the test needs a query that *would* match if the boundary were actually broken. Extending past semantic-only search this way caught a real, if minor, gap: T4 had a `Transaction` fixture but no matching `EvidenceItem` at all, which crashed the test before it even reached the boundary logic — closed by adding T4's missing evidence rather than working around the test. Needs Weaviate running (`docker-compose up -d`) in addition to Postgres.
 
 `tests/test_disputedesk.py` still imports v1 `recommend_action` (commented out) and is not part of the live path.
 
@@ -303,7 +356,8 @@ uv run pytest tests/test_permission_boundary.py -v
 | ------------------------------------ | ------------------------------------------------------------------------------------------------ |
 | `disputedesk.py`                     | Models, tenant-scoped pgvector retrieve, fraud z-score, Claude draft, critic, HITL, LangGraph    |
 | `mcp_server.py`                      | MCP stdio server: `resolve_dispute` / `approve_dispute` wrap `app_graph`                         |
-| `seed_evidence.py`                   | One-time insert of fixture evidence rows (tenant_id + embedding) into Postgres                   |
+| `seed_evidence.py`                   | One-time insert of fixture evidence rows (tenant_id + embedding) into Postgres **and** Weaviate  |
+| `docker-compose.yml`                 | Local Weaviate container (comparison experiment only, not required for the main pipeline)        |
 | `.cursor/mcp.json`                   | Cursor MCP config (absolute `.venv/bin/python` + `mcp_server.py`)                                |
 | `anthropic_api_call.py`              | Anthropic client (`ANTHROPIC_API_KEY` from `.env`)                                               |
 | `run`                                | Wrapper that always uses `.venv/bin/python`                                                      |
@@ -348,3 +402,5 @@ uv run pytest tests/test_permission_boundary.py -v
 **v5** — Multi-tenant isolation, closing a permission-boundary gap from the original `v3` spec rather than the roadmap's actual `v5` (see the note at the top of this file). `tenant_id` on `Transaction`, `EvidenceItem`, `DisputeState`, Postgres `evidence`, retrieve (`WHERE tenant_id AND transaction_id`), and fraud (z-score against that tenant's amounts only; unknown pair → `"transaction not found for this tenant"`). MCP `resolve_dispute` takes `tenant_id`; thread ids are `dispute-{tenant_id}-{transaction_id}`. Seed via `seed_evidence.py`. Found and fixed a real bug this exposed: pre-fix, the fraud z-score was computed across all tenants combined, which was both a soft data leak and statistically wrong — fixing it changed T1's fraud verdict from anomalous to normal. Permission-boundary tests in `tests/test_permission_boundary.py` (9/9 passing: every transaction against every tenant that doesn't own it, plus a positive sanity check). Run tests with `uv run pytest` so pytest uses `.venv`, not system Python.
 
 **v5.1** — Hybrid retrieval. Added Postgres full-text search (`text_search` generated `tsvector` column + GIN index) as `retrieve_evidence_keyword`, alongside the existing `retrieve_evidence_semantic`. Combined via `retrieve_evidence_hybrid` using Reciprocal Rank Fusion (`1/(60+rank)` per method, summed across both lists) rather than raw-score averaging, since cosine distance and `ts_rank` aren't on comparable scales. `retrieve_node` now calls the hybrid function, not semantic alone. Deliberately did not implement BM25 — Postgres's `ts_rank` predates it and lacks BM25's term-frequency saturation and document-length normalization, but those matter most for long, variable-length documents, and this project's evidence is short, uniform-length snippets; a real BM25 extension (ParadeDB `pg_search`) is the concrete answer if that stops being true. Verified with a real comparison, not an assumed one: a query about an exact identifier (`TRK556`) diverged meaningfully between keyword-only (hard filter, missed a genuinely related but differently-worded row entirely) and semantic-only (no word-overlap requirement, caught it) — hybrid correctly surfaced both. Extended `tests/test_permission_boundary.py` to cover the two new retrieval methods (9 → 19 cases), using attack queries built from the target transaction's own evidence text so a passing test actually proves the boundary works rather than coincidentally returning nothing. That extension caught a real fixture gap: T4 had a `Transaction` but no matching `EvidenceItem`, crashing the test before it reached any tenant-boundary logic — fixed by adding T4's evidence rather than working around the test. (v5.1 complete — see *Known limitations* and *What's next* for what the roadmap's real v5/v6 still require.)
+
+**v5.2** — Weaviate comparison. Ran locally via Docker (`docker-compose.yml`, `cr.weaviate.io/semitechnologies/weaviate:1.39.0`), auto-vectorizer modules disabled (`ENABLE_MODULES: ''`), `Evidence` collection created with `Configure.Vectors.self_provided()` so it's seeded with the exact same MiniLM embeddings as pgvector — isolating the comparison to "which database searches vectors better," not "which embedding model is better." `retrieve_evidence_weaviate` mirrors `retrieve_evidence_semantic`'s signature, filtered by `Filter.by_property(...).equal(...)` for tenant + transaction scoping. Two real, measured findings rather than assumed ones: ranking came back identical to pgvector at this data scale (correctly — 3 candidates leaves no room for the two systems' approximate-nearest-neighbor indexing to diverge), and a real ~13% latency gap (pgvector 10.75ms mean vs. Weaviate 12.14ms mean over 20 warmed-up calls) that's honestly attributable mostly to client-protocol overhead (`psycopg2`'s binary protocol vs. Weaviate's HTTP/gRPC) rather than indexing efficiency, at this tiny data scale. pgvector remains the live retrieval backend — this is a documented comparison, not a migration. Extended `tests/test_permission_boundary.py` to cover Weaviate's separate filter implementation (24/24 passing across four retrieval methods). (v5.2 complete.)

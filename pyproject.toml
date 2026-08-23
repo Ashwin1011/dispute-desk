@@ -19,6 +19,7 @@ dependencies = [
     "python-dotenv",
     "sentence-transformers",
     "uvicorn",
+    "weaviate-client>=4.23.0",
 ]
 
 [project.optional-dependencies]
