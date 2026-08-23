@@ -4,7 +4,7 @@ A payment-dispute / chargeback copilot. A LangGraph pipeline retrieves evidence 
 
 Evidence, fraud scoring, and MCP calls are **scoped to a tenant**. A tenant cannot retrieve another tenant's evidence or score fraud on another tenant's transactions.
 
-**Current milestone:** the full `retrieve ∥ fraud → draft → critic → conditional HITL → submit → audit-log` pipeline is built, checkpointed, and shipped as an MCP server — verified live from Cursor, including a real human-rejection path. Retrieval and fraud checking are now tenant-scoped, backed by a 9/9-passing automated cross-tenant test suite. See *Known limitations* and *What's next* below before treating any part of this as finished.
+**Current milestone:** the full `retrieve ∥ fraud → draft → critic → conditional HITL → submit → audit-log` pipeline is built, checkpointed, and shipped as an MCP server — verified live from Cursor, including a real human-rejection path. Retrieval and fraud checking are tenant-scoped, and retrieval is now **hybrid** (Postgres full-text keyword search fused with pgvector semantic search via Reciprocal Rank Fusion) rather than semantic-only — all three retrieval methods, plus fraud checking, are covered by a 19/19-passing automated cross-tenant test suite. See *Known limitations* and *What's next* below before treating any part of this as finished.
 
 > **Note on version numbers below:** the `v0`–`v5.x` tags in this file are this project's own chronological build order, not the phase numbers from the project's planning docs. There, `v4` names the whole multi-agent + MCP milestone, and `v5` names a golden-dataset eval + CI-gated regression + formal red-team suite that **has not been started**. What this file calls `v5` (tenant isolation) is really closing a permission-boundary gap the original plan scoped under `v3`. Flagging this so the two don't read as contradictory.
 
@@ -33,15 +33,21 @@ START ──► retrieve ──► draft ──► critic ──┬── (escal
 
 `retrieve` and `fraud` run from `START` in parallel; both must finish before `draft`. After the critic, `route_after_critic` sends the run to `await_approval` only when `escalate_for_review` is true; otherwise it skips the human and goes to `submit`.
 
-### Retrieve (`retrieve_node` / v3.2, tenant-scoped in v5)
+### Retrieve (`retrieve_node` / v3.2, tenant-scoped in v5, hybrid in v5.1)
 
-`retrieve_evidence_semantic(query, tenant_id, transaction_id, top_k=2)`:
+`retrieve_node` calls `retrieve_evidence_hybrid`, which combines two independently tenant-scoped retrieval methods rather than relying on either alone:
 
-1. Embeds the customer message with `SentenceTransformer("all-MiniLM-L6-v2")` (384-d).
-2. Queries Postgres `evidence` with pgvector cosine distance (`<=>`), **filtered to that `tenant_id` and `transaction_id`**.
-3. Returns the closest `top_k` texts. A wrong tenant gets an empty list (no cross-tenant leakage).
+**Semantic** — `retrieve_evidence_semantic(query, tenant_id, transaction_id, top_k)`. Embeds the query with `SentenceTransformer("all-MiniLM-L6-v2")` (384-d), ranks by pgvector cosine distance (`<=>`), filtered to `tenant_id` + `transaction_id`. Always returns *something* ranked "closest," even when nothing is actually that close — no requirement that any literal words overlap.
 
-Earlier (v2.7) this was in-memory "grab every `EvidenceItem` for this ID" with no embeddings. That helper is commented out.
+**Keyword** — `retrieve_evidence_keyword(query, tenant_id, transaction_id, top_k)`. `evidence.text_search` is a generated `tsvector` column (`GENERATED ALWAYS AS (to_tsvector('english', text)) STORED`, GIN-indexed), auto-derived from `text` on every insert. A query is normalized the same way via `plainto_tsquery`, matched with the `@@` operator, and ranked by `ts_rank`. Unlike semantic search, this is a **hard filter first** — a row only comes back at all if it shares an actual word (lexeme) with the query; there's no partial credit for "topically related."
+
+**Fusion** — `retrieve_evidence_hybrid(query, tenant_id, transaction_id, top_k, rrf_k=60)`. Pulls `top_k=10` from each method independently, then combines via Reciprocal Rank Fusion: each result's score is `1/(rrf_k + rank)` in whichever list(s) it appears, summed across both lists, then re-sorted and truncated to the real `top_k`. RRF fuses by *rank position*, not raw score — cosine distance and `ts_rank` live on incomparable scales, so averaging them directly wouldn't mean anything.
+
+**Verified, not assumed to help:** ran a query about an exact identifier ("what about tracking TRK556") against real fixture data with three T1 evidence rows. Keyword search returned only the row containing the literal string `TRK556` — a second, genuinely delivery-related row ("order confirmation email...") shares zero words with the query, so it never passed the `@@` filter at all, not just ranked lower. Semantic search returned both, since it has no word-overlap requirement. Hybrid correctly surfaced both, tracking-number evidence first. A specific, reproducible divergence — not a description of what hybrid search is supposed to do in theory.
+
+**Deliberately not BM25.** Postgres's built-in `ts_rank` predates BM25 and lacks its two key improvements — term-frequency saturation and document-length normalization — both of which matter most for large, variable-length document collections. DisputeDesk's evidence is uniformly short, single-sentence snippets, where those advantages are largely theoretical rather than practical. Documented as a reasoned trade-off, not an oversight: if evidence documents ever grow longer and more variable (full email threads, multi-paragraph tickets), the concrete next move is the ParadeDB `pg_search` Postgres extension (real BM25 via Tantivy, no new infrastructure to run) or a dedicated search engine — not needed for the data this project actually has today.
+
+Earlier (v2.7) retrieval was in-memory "grab every `EvidenceItem` for this ID" with no embeddings. That helper is commented out.
 
 ### Fraud (`fraud_node` / v3.3, tenant-scoped in v5)
 
@@ -165,7 +171,7 @@ Named here on purpose rather than left implicit — these are the honest edges o
 
 ## What's next
 
-Per the original build plan: hybrid search (Postgres full-text + pgvector, since evidence contains both exact identifiers like tracking numbers and paraphrased complaint text that call for different retrieval strategies) and a documented Weaviate comparison experiment, now that they'd sit on top of a properly tenant-scoped retriever instead of a leaky one. After that: Tavily for looking up current dispute policy externally, then the project's actual `v5` — a golden-dataset eval, CI-gated regression, and a formal red-team suite (the permission-boundary tests above are a first real piece of that, worth folding in rather than rebuilding) — and `v6`, production deployment with monitoring and a maintenance runbook.
+Per the original build plan: hybrid search (Postgres full-text + pgvector) is **done** — `retrieve_node` now calls `retrieve_evidence_hybrid`, verified against a real keyword-vs-semantic divergence rather than just described. Still pending from that same phase: a documented **Weaviate comparison experiment** (same evidence, measured retrieval quality/latency against the current pgvector + Postgres-full-text setup — a genuine "did switching vector stores help, and by how much" writeup, not a replacement). After that: Tavily for looking up current dispute policy externally, then the project's actual `v5` — a golden-dataset eval, CI-gated regression, and a formal red-team suite (the permission-boundary tests above are a first real piece of that, worth folding in rather than rebuilding) — and `v6`, production deployment with monitoring and a maintenance runbook.
 
 ## Python environment (`.venv`)
 
@@ -281,13 +287,13 @@ To run the server by hand (same interpreter the MCP config uses):
 uv run uvicorn disputedesk:app --reload
 ```
 
-**Tests** — tenant isolation (live path). Needs Postgres with seeded evidence:
+**Tests** — tenant isolation across every retrieval method (live path). Needs Postgres with seeded evidence:
 
 ```bash
 uv run pytest tests/test_permission_boundary.py -v
 ```
 
-9 cases: every transaction tried against every tenant that doesn't own it (retrieval + fraud check both), plus one positive sanity check proving the boundary blocks wrong tenants without blocking everyone.
+19 cases: every transaction tried against every tenant that doesn't own it, across all three retrieval methods (semantic, keyword, hybrid) plus the fraud check, plus five positive sanity checks proving the boundary blocks wrong tenants without blocking everyone. The keyword/hybrid cross-tenant cases deliberately build their attack query from the target transaction's own evidence text — a generic query would return empty regardless of whether the tenant boundary works at all (keyword search's hard match gate means "no shared words" and "correctly blocked" look identical), so the test needs a query that *would* match if the boundary were actually broken. Extending past semantic-only search this way caught a real, if minor, gap: T4 had a `Transaction` fixture but no matching `EvidenceItem` at all, which crashed the test before it even reached the boundary logic — closed by adding T4's missing evidence rather than working around the test.
 
 `tests/test_disputedesk.py` still imports v1 `recommend_action` (commented out) and is not part of the live path.
 
@@ -339,4 +345,6 @@ uv run pytest tests/test_permission_boundary.py -v
 
 **v4** — MCP server. `mcp_server.py` (`MCPServer`, stdio) exposes `resolve_dispute` and `approve_dispute` over the same `app_graph`. Cursor config is `.cursor/mcp.json` using `.venv/bin/python` so the GUI spawn does not depend on `uv` being on PATH. Verified live from Cursor's Agent chat, including a real human-rejection path. (v4 complete.)
 
-**v5** — Multi-tenant isolation, closing a permission-boundary gap from the original `v3` spec rather than the roadmap's actual `v5` (see the note at the top of this file). `tenant_id` on `Transaction`, `EvidenceItem`, `DisputeState`, Postgres `evidence`, retrieve (`WHERE tenant_id AND transaction_id`), and fraud (z-score against that tenant's amounts only; unknown pair → `"transaction not found for this tenant"`). MCP `resolve_dispute` takes `tenant_id`; thread ids are `dispute-{tenant_id}-{transaction_id}`. Seed via `seed_evidence.py`. Found and fixed a real bug this exposed: pre-fix, the fraud z-score was computed across all tenants combined, which was both a soft data leak and statistically wrong — fixing it changed T1's fraud verdict from anomalous to normal. Permission-boundary tests in `tests/test_permission_boundary.py` (9/9 passing: every transaction against every tenant that doesn't own it, plus a positive sanity check). Run tests with `uv run pytest` so pytest uses `.venv`, not system Python. (v5, as scoped here, complete — see *Known limitations* and *What's next* for what the roadmap's real v5/v6 still require.)
+**v5** — Multi-tenant isolation, closing a permission-boundary gap from the original `v3` spec rather than the roadmap's actual `v5` (see the note at the top of this file). `tenant_id` on `Transaction`, `EvidenceItem`, `DisputeState`, Postgres `evidence`, retrieve (`WHERE tenant_id AND transaction_id`), and fraud (z-score against that tenant's amounts only; unknown pair → `"transaction not found for this tenant"`). MCP `resolve_dispute` takes `tenant_id`; thread ids are `dispute-{tenant_id}-{transaction_id}`. Seed via `seed_evidence.py`. Found and fixed a real bug this exposed: pre-fix, the fraud z-score was computed across all tenants combined, which was both a soft data leak and statistically wrong — fixing it changed T1's fraud verdict from anomalous to normal. Permission-boundary tests in `tests/test_permission_boundary.py` (9/9 passing: every transaction against every tenant that doesn't own it, plus a positive sanity check). Run tests with `uv run pytest` so pytest uses `.venv`, not system Python.
+
+**v5.1** — Hybrid retrieval. Added Postgres full-text search (`text_search` generated `tsvector` column + GIN index) as `retrieve_evidence_keyword`, alongside the existing `retrieve_evidence_semantic`. Combined via `retrieve_evidence_hybrid` using Reciprocal Rank Fusion (`1/(60+rank)` per method, summed across both lists) rather than raw-score averaging, since cosine distance and `ts_rank` aren't on comparable scales. `retrieve_node` now calls the hybrid function, not semantic alone. Deliberately did not implement BM25 — Postgres's `ts_rank` predates it and lacks BM25's term-frequency saturation and document-length normalization, but those matter most for long, variable-length documents, and this project's evidence is short, uniform-length snippets; a real BM25 extension (ParadeDB `pg_search`) is the concrete answer if that stops being true. Verified with a real comparison, not an assumed one: a query about an exact identifier (`TRK556`) diverged meaningfully between keyword-only (hard filter, missed a genuinely related but differently-worded row entirely) and semantic-only (no word-overlap requirement, caught it) — hybrid correctly surfaced both. Extended `tests/test_permission_boundary.py` to cover the two new retrieval methods (9 → 19 cases), using attack queries built from the target transaction's own evidence text so a passing test actually proves the boundary works rather than coincidentally returning nothing. That extension caught a real fixture gap: T4 had a `Transaction` but no matching `EvidenceItem`, crashing the test before it reached any tenant-boundary logic — fixed by adding T4's evidence rather than working around the test. (v5.1 complete — see *Known limitations* and *What's next* for what the roadmap's real v5/v6 still require.)

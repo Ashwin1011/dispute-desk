@@ -74,8 +74,11 @@ class EvidenceItem:
 
 evidence_items = [
     EvidenceItem("electromart", "T1", "Courier tracking TRK556 shows delivered Aug 9, signed at the billing address."),
+    EvidenceItem("electromart", "T1", "Order confirmation email was sent to the customer on Aug 3 with estimated delivery Aug 9-11."),
+    EvidenceItem("electromart", "T1", "Customer's account has two prior disputes marked as customer error, both resolved without refund."),
     EvidenceItem("electromart", "T2", "No delivery confirmation on file for this order."),
     EvidenceItem("subscribebox", "T3", "Order history shows only one charge of ₹50 on this date — no duplicate found."),
+    EvidenceItem("subscribebox", "T4", "Delivery confirmed via courier tracking SBX882, signed for at the customer's registered address on Aug 15.")
 ]
 
 # a tiny pretend database, standing in for real records
@@ -209,6 +212,35 @@ def retrieve_evidence_semantic(query_text: str, tenant_id: str, transaction_id: 
     rows = cur.fetchall()
     return [text for text, distance in rows]
 
+def retrieve_evidence_keyword(query_text: str, tenant_id: str, transaction_id: str, top_k: int = 2) -> list[str]:
+    with conn.cursor() as query_cur:
+        query_cur.execute(
+            """
+            SELECT text, ts_rank(text_search, plainto_tsquery('english', %s)) AS rank
+            FROM evidence
+            WHERE tenant_id = %s AND transaction_id = %s
+              AND text_search @@ plainto_tsquery('english', %s)
+            ORDER BY rank DESC
+            LIMIT %s
+            """,
+            (query_text, tenant_id, transaction_id, query_text, top_k),
+        )
+        rows = query_cur.fetchall()
+    return [text for text, rank in rows]
+
+def retrieve_evidence_hybrid(query_text: str, tenant_id: str, transaction_id: str, top_k: int = 2, rrf_k: int = 60) -> list[str]:
+    semantic_results = retrieve_evidence_semantic(query_text, tenant_id, transaction_id, top_k=10)
+    keyword_results = retrieve_evidence_keyword(query_text, tenant_id, transaction_id, top_k=10)
+
+    scores: dict[str, float] = {}
+    for rank, text in enumerate(semantic_results, start=1):
+        scores[text] = scores.get(text, 0.0) + 1.0 / (rrf_k + rank)
+    for rank, text in enumerate(keyword_results, start=1):
+        scores[text] = scores.get(text, 0.0) + 1.0 / (rrf_k + rank)
+
+    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    return [text for text, _ in ranked[:top_k]]
+
 def route_after_critic(state: DisputeState) -> str:
     verdict = state["critic_verdict"]
     assert verdict is not None, "route_after_critic requires critic_node to run first"
@@ -237,8 +269,8 @@ def fraud_node(state: DisputeState, config: RunnableConfig) -> dict:
     return {"fraud_flag": flag}
 
 def retrieve_node(state: DisputeState, config: RunnableConfig) -> dict:
-    evidence = retrieve_evidence_semantic(state["customer_message"], state["tenant_id"], state["transaction_id"], top_k=2)
-    log_decision(get_thread_id(config), state["transaction_id"], "retrieve", {"tenant_id": state["tenant_id"], "transaction_id": state["transaction_id"], "evidence_count": len(evidence), "evidence": evidence})
+    evidence = retrieve_evidence_hybrid(state["customer_message"], state["tenant_id"], state["transaction_id"], top_k=2, rrf_k=60)
+    log_decision(get_thread_id(config), state["transaction_id"], "hybrid", {"tenant_id": state["tenant_id"], "transaction_id": state["transaction_id"], "evidence_count": len(evidence), "evidence": evidence})
     return {"evidence": evidence}
 
 def draft_node(state: DisputeState, config: RunnableConfig) -> dict:
@@ -401,7 +433,8 @@ def main():
 
     # print(retrieve_evidence_semantic("the customer says their package never arrived"))
 
-    run_dispute("I have a duplicate charge on my card, I never ordered anything.", "electromart", "T1", "dispute-T1-demo")
+    # run_dispute("I have a duplicate charge on my card, I never ordered anything.", "electromart", "T1", "dispute-T1-demo")
+    print("hybrid:", retrieve_evidence_hybrid("what about tracking TRK556", "electromart", "T1", top_k=2))
     # run_dispute("I have a duplicate charge on my card, I never ordered anything.", "T2", "dispute-T2-demo")
 
 
