@@ -18,6 +18,7 @@ dependencies = [
     "pydantic",
     "python-dotenv",
     "sentence-transformers",
+    "tavily-python>=0.7.27",
     "uvicorn",
     "weaviate-client>=4.23.0",
 ]

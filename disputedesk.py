@@ -18,6 +18,13 @@ import json
 import weaviate
 from weaviate.classes.config import Configure, DataType, Property
 from weaviate.classes.query import Filter
+from tavily import TavilyClient
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+tavily_client = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
 import time
 
 weaviate_client = weaviate.connect_to_local()
@@ -144,6 +151,7 @@ class DisputeState(TypedDict):
     critic_verdict: Optional[CriticVerdict]
     approved: Optional[bool]
     submitted: Optional[bool]
+    policy_context: Optional[str]
 
 def _normalize(text: str) -> str:
     return text.strip().rstrip(".").lower()
@@ -338,29 +346,81 @@ def submit_node(state: DisputeState, config: RunnableConfig) -> dict:
     )
     return {"submitted": submitted}
 
+REASON_TO_SEARCH_PHRASE = {
+    "unrecognized": "unauthorized transaction chargeback reason code",
+    "product_not_received": "merchandise or service not received chargeback reason code",
+    "duplicate": "duplicate processing chargeback reason code",
+    "product_unacceptable": "defective or not as described chargeback reason code",
+}
+
+
+def classify_dispute_reason(customer_message: str) -> str:
+    prompt = f"""A customer wrote this dispute message:
+                "{customer_message}"
+
+    Classify it into exactly one of: unrecognized, product_not_received, duplicate, product_unacceptable.
+    Respond with ONLY the category name, nothing else."""
+
+    response = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=20,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return message_text(response).strip()
+
+
+def format_policy_context(results: list[dict]) -> str:
+    """Turn Tavily's raw results into a citable block for the drafting prompt."""
+    lines = []
+    for r in results[:3]:  # top 3 by relevance score
+        lines.append(f"- {r['title']} ({r['url']}): {r['content']}")
+    return "\n".join(lines)
+
+
+def policy_lookup_node(state: DisputeState, config: RunnableConfig) -> dict:
+    reason = classify_dispute_reason(state["customer_message"])
+    search_phrase = REASON_TO_SEARCH_PHRASE.get(reason, "chargeback dispute policy")
+    query = f"Visa Mastercard {search_phrase}"
+    response = tavily_client.search(query=query, max_results=3)
+    policy_context = format_policy_context(response["results"])
+    log_decision( get_thread_id(config), state["transaction_id"], "policy_lookup", {"query": query, "num_results": len(response["results"])})
+    return {"policy_context": policy_context}
+
 graph = StateGraph(DisputeState)
-graph.add_node("retrieve",retrieve_node)
-graph.add_node("fraud", fraud_node)
-graph.add_node("draft", draft_node)
-graph.add_node("critic", critic_node)
-graph.add_node("await_approval", await_approval_node)
-graph.add_node("submit", submit_node)
+# graph.add_node("retrieve",retrieve_node)
+# graph.add_node("fraud", fraud_node)
+# graph.add_node("draft", draft_node)
+# graph.add_node("critic", critic_node)
+# graph.add_node("await_approval", await_approval_node)
+# graph.add_node("submit", submit_node)
+graph.add_node("policy_lookup", policy_lookup_node)
 
-graph.add_edge(START, "fraud")
-graph.add_edge(START, "retrieve")
-graph.add_edge("retrieve", "draft")
-graph.add_edge("fraud", "draft")
-graph.add_edge("draft", "critic")
+# graph.add_edge(START, "fraud")
+# graph.add_edge(START, "retrieve")
+# graph.add_edge("retrieve", "draft")
+# graph.add_edge("fraud", "draft")
+# graph.add_edge("draft", "critic")
 
-graph.add_conditional_edges("critic", route_after_critic, {
-    "await_approval": "await_approval",
-    "submit": "submit",
-})
-graph.add_edge("await_approval", "submit")
-graph.add_edge("submit", END)
+# graph.add_conditional_edges("critic", route_after_critic, {
+#     "await_approval": "await_approval",
+#     "submit": "submit",
+# })
+# graph.add_edge("await_approval", "submit")
+# graph.add_edge("submit", END)
+
+graph.add_edge(START, "policy_lookup")
+graph.add_edge("policy_lookup", END)
 
 checkpointer = MemorySaver()
 app_graph = graph.compile(checkpointer=checkpointer)
+
+# graph2 = StateGraph(PolicyState)
+# graph2.add_node("retrieve_policy", retrieve_policy_node)
+# graph2.add_edge(START, "retrieve_policy")
+# graph2.add_edge("retrieve_policy", END)
+
+# checkpointer2 = MemorySaver()
+# app_graph2 = graph2.compile(checkpointer=checkpointer2)
 
 # @app.post("/classify")
 # def classify_endpoint(request: ClassifyRequest) -> DraftClassification:
@@ -427,6 +487,7 @@ def run_dispute(customer_message: str, tenant_id: str, transaction_id: str, thre
         "critic_verdict": None,
         "approved": None,
         "submitted": None,
+        "policy_context": None,
     }, config=config)
 
     if "__interrupt__" in result:
@@ -477,11 +538,11 @@ def main():
 
     # run_dispute("I have a duplicate charge on my card, I never ordered anything.", "electromart", "T1", "dispute-T1-demo")
     # print("hybrid:", retrieve_evidence_hybrid("what about tracking TRK556", "electromart", "T1", top_k=2))
-    # run_dispute("I have a duplicate charge on my card, I never ordered anything.", "T2", "dispute-T2-demo")
+    run_dispute("I have a duplicate charge on my card, I never ordered anything.","electromart", "T2", "dispute-T2-demo")
     # print("pgvector:", retrieve_evidence_semantic("what about tracking TRK556", "electromart", "T1", top_k=2))
     # print("weaviate:", retrieve_evidence_weaviate("what about tracking TRK556", "electromart", "T1", top_k=2))
-    print("pgvector:", benchmark(retrieve_evidence_semantic, "what about tracking TRK556", "electromart", "T1", top_k=2));
-    print("weaviate:", benchmark(retrieve_evidence_weaviate, "what about tracking TRK556", "electromart", "T1", top_k=2));
+    # print("pgvector:", benchmark(retrieve_evidence_semantic, "what about tracking TRK556", "electromart", "T1", top_k=2));
+    # print("weaviate:", benchmark(retrieve_evidence_weaviate, "what about tracking TRK556", "electromart", "T1", top_k=2));
     weaviate_client.close()
     conn.close()
 
