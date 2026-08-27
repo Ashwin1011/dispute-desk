@@ -4,11 +4,11 @@ A payment-dispute / chargeback copilot. A LangGraph pipeline retrieves evidence 
 
 Evidence, fraud scoring, and MCP calls are **scoped to a tenant**. A tenant cannot retrieve another tenant's evidence or score fraud on another tenant's transactions.
 
-**Current milestone:** the full `retrieve ∥ fraud → draft → critic → conditional HITL → submit → audit-log` pipeline is built, checkpointed, and shipped as an MCP server — verified live from Cursor, including a real human-rejection path. Retrieval and fraud checking are tenant-scoped, retrieval is **hybrid** (Postgres full-text keyword search fused with pgvector semantic search via Reciprocal Rank Fusion), and a fourth retrieval path (Weaviate, run locally via Docker, seeded with identical embeddings) has been measured against pgvector as a documented comparison experiment — not adopted, pgvector remains the live path. All four retrieval methods, plus fraud checking, are covered by a 24/24-passing automated cross-tenant test suite. See *Known limitations* and *What's next* below before treating any part of this as finished.
+**Current milestone:** the full `retrieve ∥ fraud → [policy_lookup] → draft → critic → conditional HITL → submit → audit-log` pipeline is built, checkpointed, and shipped as an MCP server — verified live from Cursor, including a real human-rejection path. Retrieval and fraud checking are tenant-scoped, retrieval is **hybrid** (Postgres full-text keyword search fused with pgvector semantic search via Reciprocal Rank Fusion), a fourth retrieval path (Weaviate, run locally via Docker, seeded with identical embeddings) has been measured against pgvector as a documented comparison experiment — not adopted, pgvector remains the live path — and when local evidence comes back empty, a **Tavily policy lookup** now feeds real external card-network reason-code content into the draft instead of drafting blind, with a deliberate, structural escalation rule ensuring a policy-only draft always reaches a human. All four retrieval methods, plus fraud checking, are covered by a 24/24-passing automated cross-tenant test suite. See *Known limitations* and *What's next* below before treating any part of this as finished.
 
 > **Note on version numbers below:** the `v0`–`v5.x` tags in this file are this project's own chronological build order, not the phase numbers from the project's planning docs. There, `v4` names the whole multi-agent + MCP milestone, and `v5` names a golden-dataset eval + CI-gated regression + formal red-team suite that **has not been started**. What this file calls `v5` (tenant isolation) is really closing a permission-boundary gap the original plan scoped under `v3`. Flagging this so the two don't read as contradictory.
 
-## What it does (through v5)
+## What it does (through v5.3)
 
 `main()` invokes `app_graph` with a customer message, a tenant, and a transaction. If the critic escalates, the run **pauses** and `main()` resumes with `Command(resume={"approved": True})`. If it does not escalate, the first `invoke` finishes through `submit` (auto-approved) and there is nothing to resume. Shared state is `DisputeState`:
 
@@ -19,6 +19,7 @@ Evidence, fraud scoring, and MCP calls are **scoped to a tenant**. A tenant cann
 | `transaction_id`   | input                                 | Which order to look up (`T1` …)       |
 | `evidence`         | `retrieve`                            | Top-k evidence strings from Postgres  |
 | `fraud_flag`       | `fraud`                               | Amount z-score vs that tenant's txs   |
+| `policy_context`   | `policy_lookup` (only if evidence is empty) | Tavily reason-code search results, or `None` |
 | `draft`            | `draft` (maybe rewritten by `critic`) | Reason, citations, reply, confidence  |
 | `critic_verdict`   | `critic`                              | Grounded? Escalate? Notes             |
 | `approved`         | `await_approval`                      | Human yes/no from `Command(resume=…)` |
@@ -27,11 +28,15 @@ Evidence, fraud scoring, and MCP calls are **scoped to a tenant**. A tenant cann
 Graph:
 
 ```
-START ──► retrieve ──► draft ──► critic ──┬── (escalate_for_review) ──► await_approval ──► submit ──► END
-       └► fraud    ──►                   └── (else) ─────────────────► submit ──────────► END
+START ──► retrieve ──┬─(evidence empty)─► policy_lookup ─┐
+       │              └─(else)───────────────────────────┤
+       └► fraud ──────────────────────────────────────────┴─► draft* ──► critic ──┬─(escalate_for_review)─► await_approval ──► submit ──► END
+                                                                                    └─(else)──────────────────────────────────► submit ──► END
 ```
 
-`retrieve` and `fraud` run from `START` in parallel; both must finish before `draft`. After the critic, `route_after_critic` sends the run to `await_approval` only when `escalate_for_review` is true; otherwise it skips the human and goes to `submit`.
+`retrieve` and `fraud` run from `START` in parallel. `route_after_retrieve` sends `retrieve`'s output to `policy_lookup` only when `evidence` came back empty; otherwise it goes straight to `draft`. After the critic, `route_after_critic` sends the run to `await_approval` only when `escalate_for_review` is true; otherwise it skips the human and goes to `submit`.
+
+`*` `draft` is registered with `defer=True`. Without it, `fraud`'s edge to `draft` is unconditional and fires as soon as `fraud` finishes — one superstep before the `policy_lookup` branch (which takes an extra hop) can possibly complete, so `draft` would run prematurely with no policy context on exactly the case it was added to help, or run a second time once `policy_lookup` actually finished. `defer=True` holds `draft` until every branch that could reach it has actually finished, regardless of how many steps each branch takes — verified by checking the audit log's timestamps: `draft` fires only once, after `policy_lookup`, even though `fraud` completed several seconds earlier.
 
 ### Retrieve (`retrieve_node` / v3.2, tenant-scoped in v5, hybrid in v5.1)
 
@@ -66,6 +71,18 @@ pgvector is consistently faster by roughly 1.4 ms (~13%) — real and reproducib
 
 **Verified tenant-isolated too, not just measured.** `retrieve_evidence_weaviate` has its own filter implementation, separate from the SQL-based ones — covered in `tests/test_permission_boundary.py` the same way as every other retrieval method.
 
+### Policy lookup (`policy_lookup_node` / v5.3)
+
+Fires only when `retrieve`'s output was empty — the fallback for the fallback: local RAG found nothing, so drop to an external source rather than draft blind. `route_after_retrieve` checks `len(state["evidence"]) == 0` and conditionally routes to `policy_lookup` instead of straight to `draft`.
+
+`classify_dispute_reason` is a cheap Claude call (`max_tokens=20`) that reuses the exact same `reason` taxonomy `DraftResponse` already has — `unrecognized | product_not_received | duplicate | product_unacceptable` — rather than inventing a second classification scheme just to build a search query. That category is mapped through a small static `REASON_TO_SEARCH_PHRASE` dict to a normalized phrase (e.g. `"duplicate processing chargeback reason code"`) before it ever reaches Tavily. That mapping is safe to hardcode — dispute-category vocabulary is stable, official card-network terminology, not something that goes stale — unlike the actual policy content, which stays live, fetched fresh from Tavily every time.
+
+**Why not just search the raw customer message?** Tried that first. A raw complaint ("I have a duplicate charge on my card, I never ordered anything.") returned generic consumer-facing "what is a chargeback" explainers (Bankrate, Discover) — a web search reads a first-person conversational sentence very differently from a normalized topic phrase. Classifying first and searching a clean category phrase (`"Visa Mastercard duplicate processing chargeback reason code"`) instead returned specific, citable reason-code content (Visa 12.6 / Mastercard 4834) — a measured before/after on the same customer message, not an assumed improvement.
+
+`format_policy_context` takes Tavily's top-3 `results` and formats each as `title (url): content`. Deliberately does not use Tavily's `include_answer` synthesis option — a synthesized answer has no traceable source, and the whole point of preferring raw results is that citability matters here too, the same way it matters for `evidence_cited`.
+
+**Not run through the same grounding check as case evidence, on purpose.** `policy_context` is general background reference material, not case-specific fact — `check_grounding` only ever validates `evidence_cited` against the internal `evidence` list. The draft prompt explicitly tells the model it may reference policy context for framing in `draft_text`, but `evidence_cited` must never include anything from it — mixing the two in the one field the critic machine-checks would make a legitimate policy reference look like a hallucinated evidence citation.
+
 ### Fraud (`fraud_node` / v3.3, tenant-scoped in v5)
 
 `check_fraud_signals(tenant_id, transaction_id)` looks up the fixture `Transaction` **among that tenant's rows only** and computes a z-score of its `amount` against that tenant's amounts (`statistics.mean` / `pstdev`). If the id is missing for that tenant, it returns `note="transaction not found for this tenant"` and does not score another merchant's order.
@@ -85,9 +102,9 @@ Output is `FraudFlag(z_score, is_anomaly, note)`.
 
 **Worth knowing:** before tenant scoping, T1's amount looked anomalous because it was being compared against *every* tenant's transactions combined, including subscribebox's much smaller ones. Scoping the z-score to electromart alone was the correct fix — but with exactly two transactions per tenant, it also means `|z|` is now mathematically always exactly `1.0` for either transaction in a tenant (the z-score of either point in a 2-point population is always `±1`, regardless of the actual amounts), so `is_anomaly` currently can never fire from amount alone. See *Known limitations*.
 
-### Draft (`draft_node` / v3–v3.2)
+### Draft (`draft_node` / v3–v3.2, policy-aware and verbatim-citation-strict in v5.3)
 
-`draft_from_evidence` sends the message plus retrieved bullets to Claude (`claude-sonnet-4-6`). The model must return JSON only:
+`draft_from_evidence` sends the message, the retrieved bullets, and (when present) `policy_context` to Claude (`claude-sonnet-4-6`). The model must return JSON only:
 
 ```json
 {
@@ -100,16 +117,22 @@ Output is `FraudFlag(z_score, is_anomaly, note)`.
 
 Markdown fences around the JSON are stripped (`parse_model_json`). Only Anthropic `TextBlock`s are read (`message_text`). Pydantic (`DraftResponse`) validates the object.
 
-### Critic (`critic_node` / v3.3)
+**`evidence_cited` must now be verbatim, not paraphrased — a real bug this project caught via its own regression testing, not a Tavily-specific fix.** Re-verifying a known-good, real-evidence case after adding `policy_lookup` (see *Critic* below for why that re-check mattered) surfaced a pre-existing gap: the model was paraphrasing citations by default — e.g. `"Courier tracking TRK556 shows delivered Aug 9, signed at the billing address."` cited back as `"Courier tracking TRK556 confirms delivery on Aug 9 with a signature at the billing address."` Same fact, faithfully represented, but `check_grounding`'s strict substring match (see *Critic*) rejected it as ungrounded — a false negative that would have needlessly escalated a routine, well-supported dispute to a human. The fix was in the prompt, not the check: `evidence_cited` and `draft_text` serve different purposes — one is machine-verified, one is customer-facing — and the prompt now says so explicitly, requiring exact character-for-character copies in `evidence_cited` while `draft_text` stays free to read naturally. Loosening `check_grounding` to fuzzy-match instead was considered and rejected — that would weaken the actual anti-hallucination guarantee; forcing verbatim citation keeps the check strict while removing the false-negative pressure.
+
+### Critic (`critic_node` / v3.3, `no_case_evidence` escalation in v5.3)
 
 `check_grounding` requires every `evidence_cited` string to appear in the retrieved evidence (normalized: trim, drop trailing `.`, lowercase, substring either way).
 
 - If not grounded: call `draft_from_evidence` **once** and re-check.
-- Escalate (`escalate_for_review`) if the fraud flag is an anomaly **or** the draft is still ungrounded after retry.
+- Escalate (`escalate_for_review`) if the fraud flag is an anomaly, **or** the draft is still ungrounded after retry, **or** there was no case evidence at all (`len(evidence) == 0`).
 
 `CriticVerdict`: `grounded`, `escalate_for_review`, `notes`.
 
-Given the fraud-anomaly path currently can't fire (see above), the grounding-failure path is, for now, the only way `escalate_for_review` actually triggers in this fixture set — confirmed by requesting a cross-tenant transaction: `evidence` comes back empty, the draft cites nothing real, `grounded=False`, and the critic escalates on its own, independent of the fraud flag. Two separate safety nets, both real.
+Given the fraud-anomaly path currently can't fire (see above) and grounding failures are now rare after the verbatim-citation fix, the `no_case_evidence` check is, for now, the main deliberate way `escalate_for_review` triggers in this fixture set.
+
+**That third condition was added after a close call, not before one — worth documenting exactly why.** The first version of `policy_lookup` only had `escalate = fraud_flag.is_anomaly or not grounded`. Testing the zero-evidence path, the model happened to hallucinate a citation of the prompt's own placeholder text (`"No evidence on file."`), which `check_grounding` correctly rejected — so that first test run escalated, but for an accidental reason. Once the placeholder-citation bug was fixed (see *Draft*), the model correctly started returning `evidence_cited: []` when there was nothing to cite — and `all(...)` over an empty list is vacuously `True`, so `grounded` came back `True`. Combined with a non-anomalous fraud flag, that combination would have **auto-submitted a response backed by zero case evidence and only a generic external policy lookup, with no human ever seeing it.** `no_case_evidence` closes that gap structurally — it forces escalation whenever `evidence` came back empty, regardless of what the model does with `evidence_cited`, rather than relying on the model behaving a particular way. Verified with two paired real runs: a zero-evidence transaction now escalates with `notes="flagged: no case evidence on file — response relies on external policy context only, needs human review"`, while a known-good, real-evidence, non-anomalous case (`electromart`/`T1`) still auto-submits with `escalate_for_review: False` — the new rule doesn't over-trigger.
+
+Two separate, independent safety nets now exist for the "empty evidence" case (`no_case_evidence` fires regardless of grounding) and the "fabricated citation" case (`check_grounding` catches it directly) — confirmed as genuinely independent by triggering each one separately, not assumed from reading the code.
 
 ### Human approval (`await_approval_node` / v3.4, routed in v3.6)
 
@@ -185,10 +208,12 @@ Named here on purpose rather than left implicit — these are the honest edges o
 - **`audit_log` has a narrow theoretical race.** `retrieve` and `fraud` run in parallel and both write to `audit_log` through the same shared `conn` (each opens its own cursor, which mitigates but doesn't fully eliminate risk under a truly concurrent executor). Worth a connection pool before this is anything more than a demo.
 - **No customer-level fraud memory.** `FraudAnalyst` only looks at one transaction's amount, tenant-scoped — it has no notion of "this customer has filed three disputes this month," which is itself a real fraud signal. Not built.
 - **Data is entirely synthetic**, by design — four fixture transactions, three evidence rows, two tenants. Good enough to prove the architecture; not a claim about handling real volume or variety.
+- **`policy_lookup` adds a second LLM call plus a live external API call, on top of the existing draft/critic calls — only on the empty-evidence path, but not free.** `classify_dispute_reason` is a cheap, small call, but it's still a real latency and cost addition, and it introduces a hard runtime dependency on the Tavily API being reachable and the key being valid — there's currently no fallback if that call fails (it would raise, not degrade gracefully to evidence-less drafting).
+- **`check_grounding`'s exact-substring match is now load-bearing on prompt discipline, not just code correctness.** The verbatim-citation fix (see *Draft*) works because the prompt explicitly tells the model to copy evidence exactly — but the check itself is still a plain string match with no semantic tolerance. Any future prompt change that lets citations drift back into paraphrase (even accidentally, e.g. while tuning `draft_text` wording) will silently reintroduce the same false-negative escalation this project just found and fixed. Worth eventually replacing the substring check with something more robust than prompt discipline alone — not done yet.
 
 ## What's next
 
-Per the original build plan: hybrid search (Postgres full-text + pgvector) and the **Weaviate comparison experiment** are both **done** — see the *Retrieve* and *Weaviate comparison* sections above for what was actually measured (identical ranking at this scale, a real ~13% latency gap attributable mostly to client-protocol overhead, not indexing quality) rather than just described. Next: Tavily, for looking up current card-network dispute policy externally instead of hardcoding rules that go stale. After that: the project's actual `v5` — a golden-dataset eval, CI-gated regression, and a formal red-team suite (the permission-boundary tests above, now 24 cases across four retrieval methods, are a first real piece of that, worth folding in rather than rebuilding) — and `v6`, production deployment with monitoring and a maintenance runbook.
+Per the original build plan: hybrid search (Postgres full-text + pgvector), the **Weaviate comparison experiment**, and the **Tavily policy-lookup fallback** are all **done** — see the *Retrieve*, *Weaviate comparison*, *Policy lookup*, and *Critic* sections above for what was actually measured and fixed (identical ranking at this scale, a real ~13% latency gap attributable mostly to client-protocol overhead, a real query-quality difference between raw-message and classified-category search, a real false-negative grounding bug found via regression testing, and a real accidental-vs-deliberate escalation gap closed) rather than just described. Next: the project's actual `v5` — a golden-dataset eval, CI-gated regression, and a formal red-team suite (the permission-boundary tests above, now 24 cases across four retrieval methods, are a first real piece of that, worth folding in rather than rebuilding) — and `v6`, production deployment with monitoring and a maintenance runbook.
 
 ## Python environment (`.venv`)
 
@@ -249,7 +274,10 @@ Create a `.env` in the project root (do not commit it):
 
 ```
 ANTHROPIC_API_KEY=your_key_here
+TAVILY_API_KEY=your_key_here
 ```
+
+`TAVILY_API_KEY` is only needed for the `policy_lookup` fallback (empty-evidence disputes) — get a free-tier key at [tavily.com](https://tavily.com) (1,000 searches/month). `uv add tavily-python` adds the client.
 
 **Postgres + pgvector** must be running locally. The app connects as:
 
@@ -324,7 +352,7 @@ uv run python disputedesk.py
 source .venv/bin/activate && python disputedesk.py
 ```
 
-With the current fixture data, T1 and T2 (electromart) and T3 and T4 (subscribebox) all draft and auto-submit without pausing — the fraud-anomaly path can't fire yet (see *Known limitations*). To actually see a pause + `Command(resume=…)` cycle right now, request a transaction under the *wrong* tenant (e.g. tenant `subscribebox`, transaction `T1`): retrieval correctly comes back empty, the draft can't ground itself, and the critic escalates. The demo still calls `Command(resume=…)` after the first invoke; that only actually does something if the graph paused — resuming an already-completed thread is a safe no-op.
+With the current fixture data, T1 and T2 (electromart) and T3 and T4 (subscribebox) all draft and auto-submit without pausing — the fraud-anomaly path can't fire yet (see *Known limitations*). To see a pause + `Command(resume=…)` cycle, request a transaction with no matching evidence — either a cross-tenant request (e.g. tenant `subscribebox`, transaction `T1`) or any `transaction_id` that simply doesn't exist for that tenant (e.g. `run_dispute("what about tracking TRK556", "subscribebox", "TRK556", "some-thread-id")`). Either way, `evidence` comes back empty, `policy_lookup` fires and populates `policy_context` from a live Tavily search, and the critic escalates via `no_case_evidence` regardless of how the draft turns out — always pausing for human review, by design. The demo still calls `Command(resume=…)` after the first invoke; that only actually does something if the graph paused — resuming an already-completed thread is a safe no-op.
 
 **MCP** — Cursor loads `.cursor/mcp.json` and spawns `mcp_server.py` over stdio. Ask the agent to resolve a dispute for a tenant (e.g. electromart T1 with `"I never received this order."`). Clean cases finish in one `resolve_dispute` call; escalate cases return `awaiting_approval` and need `approve_dispute` with the returned `thread_id`.
 
@@ -404,3 +432,5 @@ uv run pytest tests/test_permission_boundary.py -v
 **v5.1** — Hybrid retrieval. Added Postgres full-text search (`text_search` generated `tsvector` column + GIN index) as `retrieve_evidence_keyword`, alongside the existing `retrieve_evidence_semantic`. Combined via `retrieve_evidence_hybrid` using Reciprocal Rank Fusion (`1/(60+rank)` per method, summed across both lists) rather than raw-score averaging, since cosine distance and `ts_rank` aren't on comparable scales. `retrieve_node` now calls the hybrid function, not semantic alone. Deliberately did not implement BM25 — Postgres's `ts_rank` predates it and lacks BM25's term-frequency saturation and document-length normalization, but those matter most for long, variable-length documents, and this project's evidence is short, uniform-length snippets; a real BM25 extension (ParadeDB `pg_search`) is the concrete answer if that stops being true. Verified with a real comparison, not an assumed one: a query about an exact identifier (`TRK556`) diverged meaningfully between keyword-only (hard filter, missed a genuinely related but differently-worded row entirely) and semantic-only (no word-overlap requirement, caught it) — hybrid correctly surfaced both. Extended `tests/test_permission_boundary.py` to cover the two new retrieval methods (9 → 19 cases), using attack queries built from the target transaction's own evidence text so a passing test actually proves the boundary works rather than coincidentally returning nothing. That extension caught a real fixture gap: T4 had a `Transaction` but no matching `EvidenceItem`, crashing the test before it reached any tenant-boundary logic — fixed by adding T4's evidence rather than working around the test. (v5.1 complete — see *Known limitations* and *What's next* for what the roadmap's real v5/v6 still require.)
 
 **v5.2** — Weaviate comparison. Ran locally via Docker (`docker-compose.yml`, `cr.weaviate.io/semitechnologies/weaviate:1.39.0`), auto-vectorizer modules disabled (`ENABLE_MODULES: ''`), `Evidence` collection created with `Configure.Vectors.self_provided()` so it's seeded with the exact same MiniLM embeddings as pgvector — isolating the comparison to "which database searches vectors better," not "which embedding model is better." `retrieve_evidence_weaviate` mirrors `retrieve_evidence_semantic`'s signature, filtered by `Filter.by_property(...).equal(...)` for tenant + transaction scoping. Two real, measured findings rather than assumed ones: ranking came back identical to pgvector at this data scale (correctly — 3 candidates leaves no room for the two systems' approximate-nearest-neighbor indexing to diverge), and a real ~13% latency gap (pgvector 10.75ms mean vs. Weaviate 12.14ms mean over 20 warmed-up calls) that's honestly attributable mostly to client-protocol overhead (`psycopg2`'s binary protocol vs. Weaviate's HTTP/gRPC) rather than indexing efficiency, at this tiny data scale. pgvector remains the live retrieval backend — this is a documented comparison, not a migration. Extended `tests/test_permission_boundary.py` to cover Weaviate's separate filter implementation (24/24 passing across four retrieval methods). (v5.2 complete.)
+
+**v5.3** — Tavily policy-lookup fallback, plus two real bugs found and fixed along the way. `policy_lookup_node` fires only when `retrieve` comes back empty (`route_after_retrieve` conditional edge), classifies the dispute into the existing `DraftResponse.reason` taxonomy via a cheap Claude call, maps that category to a normalized search phrase (raw customer messages measurably returned worse, more generic Tavily results than a classified category phrase did), and formats Tavily's top-3 raw results — not its synthesized `include_answer` — into `policy_context` for traceability. `draft_node` is registered with `defer=True` so it correctly waits for whichever upstream branch (direct or via `policy_lookup`) actually ran, instead of firing prematurely off `fraud`'s unconditional edge — verified via audit-log timestamps, not assumed from the graph shape. Two real bugs surfaced by insisting on end-to-end regression checks rather than trusting the design on paper: (1) the model was citing the prompt's own "no evidence on file" placeholder as if it were real evidence, and separately, paraphrasing real citations closely enough in wording that `check_grounding`'s exact-substring match rejected genuinely grounded drafts — both fixed in the `draft_from_evidence` prompt (explicit empty-evidence handling, explicit verbatim-citation requirement, `draft_text` left free to paraphrase); (2) with those citation bugs fixed, a zero-evidence, non-anomalous case would have silently auto-submitted a response backed by nothing but a generic web policy lookup — closed by adding `no_case_evidence` (`len(evidence) == 0`) as a third, structural escalation condition in `critic_node`, independent of what the model does with `evidence_cited`. Verified with paired real runs: a zero-evidence case now escalates for the deliberate reason (`"no case evidence on file"` note) and a known-good real-evidence, non-anomalous case (`electromart`/`T1`) still auto-submits — confirming the new rule doesn't over-trigger. (v5.3 complete.)

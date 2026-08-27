@@ -171,11 +171,15 @@ def critic_node(state: DisputeState, config: RunnableConfig) -> dict:
 
     grounded = check_grounding(draft, evidence)
     if not grounded:
-        draft = draft_from_evidence(state["customer_message"], evidence)  # retry once
+        draft = draft_from_evidence(state["customer_message"], evidence, state["policy_context"])  # retry once
         grounded = check_grounding(draft, evidence)
 
-    escalate = fraud_flag.is_anomaly or not grounded
-    if fraud_flag.is_anomaly and grounded:
+    no_case_evidence = len(evidence) == 0
+    escalate = fraud_flag.is_anomaly or not grounded or no_case_evidence
+
+    if no_case_evidence:
+        notes = "flagged: no case evidence on file — response relies on external policy context only, needs human review"
+    elif fraud_flag.is_anomaly and grounded:
         notes = "flagged: fraud anomaly on this transaction — needs human review"
     elif not grounded:
         notes = "flagged: draft still cites unsupported evidence after retry"
@@ -273,21 +277,40 @@ def retrieve_evidence_weaviate(query_text: str, tenant_id: str, transaction_id: 
             texts.append(text)
     return texts
 
+def route_after_retrieve(state: DisputeState) -> str:
+    evidence = state["evidence"]
+    assert evidence is not None, "route_after_retrieve requires retrieve_node to run first"
+    if len(evidence) == 0:
+        return "policy_lookup"
+    return "draft"
+
 
 def route_after_critic(state: DisputeState) -> str:
     verdict = state["critic_verdict"]
     assert verdict is not None, "route_after_critic requires critic_node to run first"
     return "await_approval" if verdict.escalate_for_review else "submit"
 
-def draft_from_evidence(customer_message: str, evidence: list[str]) -> DraftResponse:
-    evidence_block = "\n".join(f"- {e}" for e in evidence) or "No evidence on file."
+def draft_from_evidence(customer_message: str, evidence: list[str], policy_context: str | None) -> DraftResponse:
+    evidence_block = (
+        "\n".join(f"- {e}" for e in evidence)
+        if evidence
+        else "No evidence on file for this transaction — evidence_cited must be an empty list."
+    )
+    policy_block = (
+        f"\n\nRelevant card-network policy (background context, not case-specific evidence):\n{policy_context}"
+        if policy_context else ""
+    )
     prompt = f"""A customer wrote this dispute message:
 "{customer_message}"
+
 Here is the evidence on file for this transaction:
-{evidence_block}
-Classify it into exactly one of: unrecognized, product_not_received, duplicate, product_unacceptable, draft a short response citing the specific evidence above,
-and rate your confidence. Respond with ONLY valid JSON matching this shape:
-{{"reason": "...", "evidence_cited": ["..."], "draft_text": "...", "confidence": 0.0}}"""
+{evidence_block}{policy_block}
+
+Classify it into exactly one of: unrecognized, product_not_received, duplicate, product_unacceptable, and draft a short customer-facing response citing the specific evidence above.
+IMPORTANT: evidence_cited must contain exact, verbatim copies of the evidence line(s) you relied on — copy them character-for-character from the evidence list above, do not paraphrase or summarize them there. draft_text may paraphrase naturally for the customer.
+You may reference the policy context above in your draft text for framing, but evidence_cited must only ever list items from the evidence section — never from the policy context.
+Rate your confidence. Respond with ONLY valid JSON matching this shape:
+{{"reason": "...", "evidence_cited": [...], "draft_text": "...", "confidence": 0.0}}"""
     response = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=300,
@@ -309,10 +332,11 @@ def retrieve_node(state: DisputeState, config: RunnableConfig) -> dict:
 def draft_node(state: DisputeState, config: RunnableConfig) -> dict:
     evidence = state["evidence"]
     assert evidence is not None, "draft_node requires retrieve_node to run first"
-    draft = draft_from_evidence(state["customer_message"], evidence)
+    draft = draft_from_evidence(state["customer_message"], evidence, state["policy_context"])
     log_decision(get_thread_id(config), state["transaction_id"], "draft",
         {"reason": draft.reason, "confidence": draft.confidence,
-         "evidence_cited": draft.evidence_cited, "draft_text": draft.draft_text},)
+         "evidence_cited": draft.evidence_cited, "draft_text": draft.draft_text,
+         "used_policy_context": state["policy_context"] is not None},)
     return {"draft": draft}
 
 def await_approval_node(state: DisputeState, config: RunnableConfig) -> dict:
@@ -387,29 +411,35 @@ def policy_lookup_node(state: DisputeState, config: RunnableConfig) -> dict:
     return {"policy_context": policy_context}
 
 graph = StateGraph(DisputeState)
-# graph.add_node("retrieve",retrieve_node)
-# graph.add_node("fraud", fraud_node)
-# graph.add_node("draft", draft_node)
-# graph.add_node("critic", critic_node)
-# graph.add_node("await_approval", await_approval_node)
-# graph.add_node("submit", submit_node)
+graph.add_node("retrieve",retrieve_node)
+graph.add_node("fraud", fraud_node)
+graph.add_node("draft", draft_node, defer=True)  # wait for whichever upstream branch actually ran
+graph.add_node("critic", critic_node)
+graph.add_node("await_approval", await_approval_node)
+graph.add_node("submit", submit_node)
 graph.add_node("policy_lookup", policy_lookup_node)
 
-# graph.add_edge(START, "fraud")
-# graph.add_edge(START, "retrieve")
-# graph.add_edge("retrieve", "draft")
-# graph.add_edge("fraud", "draft")
-# graph.add_edge("draft", "critic")
+graph.add_edge(START, "fraud")
+graph.add_edge(START, "retrieve")
+graph.add_edge("retrieve", "draft")
+graph.add_edge("fraud", "draft")
+graph.add_edge("draft", "critic")
+graph.add_edge("policy_lookup", "draft")
 
-# graph.add_conditional_edges("critic", route_after_critic, {
-#     "await_approval": "await_approval",
-#     "submit": "submit",
-# })
-# graph.add_edge("await_approval", "submit")
-# graph.add_edge("submit", END)
+graph.add_conditional_edges("critic", route_after_critic, {
+    "await_approval": "await_approval",
+    "submit": "submit",
+})
 
-graph.add_edge(START, "policy_lookup")
-graph.add_edge("policy_lookup", END)
+graph.add_conditional_edges(
+    "retrieve",
+    route_after_retrieve,
+    {"policy_lookup": "policy_lookup", "draft": "draft"},
+)
+
+graph.add_edge("await_approval", "submit")
+graph.add_edge("submit", END)
+
 
 checkpointer = MemorySaver()
 app_graph = graph.compile(checkpointer=checkpointer)
@@ -536,9 +566,15 @@ def main():
 
     # print(retrieve_evidence_semantic("the customer says their package never arrived"))
 
-    # run_dispute("I have a duplicate charge on my card, I never ordered anything.", "electromart", "T1", "dispute-T1-demo")
+    # run_dispute(
+    # "I don't recognize this charge on my card, I never ordered anything.",
+    # "electromart",
+    # "T1",
+    # "dispute-T1-regression-check",
+    # )
+    run_dispute("what about tracking TRK556", "subscribebox", "TRK556", "dispute-TRK556-demo")
     # print("hybrid:", retrieve_evidence_hybrid("what about tracking TRK556", "electromart", "T1", top_k=2))
-    run_dispute("I have a duplicate charge on my card, I never ordered anything.","electromart", "T2", "dispute-T2-demo")
+    # run_dispute("I have a duplicate charge on my card, I never ordered anything.","electromart", "T2", "dispute-T2-demo")
     # print("pgvector:", retrieve_evidence_semantic("what about tracking TRK556", "electromart", "T1", top_k=2))
     # print("weaviate:", retrieve_evidence_weaviate("what about tracking TRK556", "electromart", "T1", top_k=2))
     # print("pgvector:", benchmark(retrieve_evidence_semantic, "what about tracking TRK556", "electromart", "T1", top_k=2));
