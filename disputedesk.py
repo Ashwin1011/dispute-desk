@@ -13,7 +13,7 @@ from pgvector.psycopg2 import register_vector
 from anthropic_api_call import client
 from anthropic.types import Message, TextBlock
 from fastapi import FastAPI
-# import statistics
+import statistics
 import json
 import weaviate
 from weaviate.classes.config import Configure, DataType, Property
@@ -115,8 +115,6 @@ transactions = [
     Transaction("T7", "gizmohub", 320, date(2026, 8, 8), delivered=True, delivery_address_matches_billing=True),
     Transaction("T8", "gizmohub", 8500, date(2026, 8, 10), delivered=False, delivery_address_matches_billing=False),
     ]
-
-import statistics
 
 class FraudFlag(BaseModel):
     z_score: float
