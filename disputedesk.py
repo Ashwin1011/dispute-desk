@@ -169,6 +169,8 @@ def _normalize(text: str) -> str:
     return text.strip().rstrip(".").lower()
 
 def check_grounding(draft: DraftResponse, evidence: list[str]) -> bool:
+    if(len(draft.evidence_cited) == 0) and (len(evidence) > 0):
+        return False
     normalized_evidence = [_normalize(e) for e in evidence]
     return all(
         any(_normalize(cited) in ev or ev in _normalize(cited) for ev in normalized_evidence)
