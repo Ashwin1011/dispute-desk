@@ -12,7 +12,7 @@ jobs:
     env:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
-      POSTGRES_PASSWORD: ${{ secrets.DB_PASSWORD }}
+      DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
 
     services:
       postgres:
@@ -31,7 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Start Weaviate (docker run, not services: — see PR/commit notes on why)
+      - name: "Start Weaviate via docker run (not GitHub Actions services: — see notes)"
         run: |
           docker run -d --name weaviate \
             -p 8080:8080 -p 50051:50051 \
