@@ -1,0 +1,50 @@
+[
+  {
+    "id": "T1-electromart-real-evidence-autosubmit",
+    "actual": {
+      "evidence_empty": false,
+      "is_anomaly": false,
+      "reason": "unrecognized",
+      "escalate_for_review": false
+    },
+    "passed": true,
+    "hard_mismatches": [],
+    "soft_mismatches": []
+  },
+  {
+    "id": "cross-tenant-T1-as-subscribebox",
+    "actual": {
+      "evidence_empty": true,
+      "is_anomaly": false,
+      "reason": "product_not_received",
+      "escalate_for_review": true
+    },
+    "passed": true,
+    "hard_mismatches": [],
+    "soft_mismatches": []
+  },
+  {
+    "id": "unknown-transaction-policy-fallback",
+    "actual": {
+      "evidence_empty": true,
+      "is_anomaly": false,
+      "reason": "product_not_received",
+      "escalate_for_review": true
+    },
+    "passed": true,
+    "hard_mismatches": [],
+    "soft_mismatches": []
+  },
+  {
+    "id": "T3-subscribebox-real-evidence",
+    "actual": {
+      "evidence_empty": false,
+      "is_anomaly": false,
+      "reason": "duplicate",
+      "escalate_for_review": false
+    },
+    "passed": true,
+    "hard_mismatches": [],
+    "soft_mismatches": []
+  }
+]
