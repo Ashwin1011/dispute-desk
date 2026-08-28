@@ -39,6 +39,30 @@ def test_retrieve_evidence_works_for_correct_tenant():
     evidence = retrieve_evidence_semantic("delivery status", "electromart", "T1", top_k=2)
     assert len(evidence) > 0
 
+
+def test_fraud_check_works_for_correct_tenant():
+    # Positive path for check_fraud_signals — every existing fraud test only exercises
+    # wrong-tenant lookups, which return early before statistics.mean/pstdev ever run.
+    # That left the real z-score computation completely uncovered (a commented-out
+    # `import statistics` would have shipped silently). This exercises it directly,
+    # on a known non-anomalous transaction, and pins the exact z-score so a broken
+    # computation — not just a missing import — also fails loudly.
+    flag = check_fraud_signals("electromart", "T1")
+    assert flag.note != "transaction not found for this tenant"
+    assert isinstance(flag.z_score, float)
+    assert flag.z_score == pytest.approx(1.0)
+    assert flag.is_anomaly is False
+
+
+def test_fraud_check_flags_real_anomaly():
+    # Companion case for the other branch: gizmohub/T8 is a genuine 4-transaction
+    # population with one real outlier, so this is the one live case where
+    # is_anomaly is actually expected to fire end to end.
+    flag = check_fraud_signals("gizmohub", "T8")
+    assert flag.note != "transaction not found for this tenant"
+    assert flag.is_anomaly is True
+    assert flag.z_score > 1.5
+
 def first_evidence_text(transaction_id: str) -> str:
     for item in evidence_items:
         if item.transaction_id == transaction_id:

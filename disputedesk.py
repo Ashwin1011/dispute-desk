@@ -116,8 +116,6 @@ transactions = [
     Transaction("T8", "gizmohub", 8500, date(2026, 8, 10), delivered=False, delivery_address_matches_billing=False),
     ]
 
-import statistics
-
 class FraudFlag(BaseModel):
     z_score: float
     is_anomaly: bool
