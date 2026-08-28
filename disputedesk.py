@@ -21,6 +21,7 @@ from weaviate.classes.query import Filter
 from tavily import TavilyClient
 import os
 from dotenv import load_dotenv
+import atexit
 
 load_dotenv()
 
@@ -28,12 +29,17 @@ tavily_client = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
 import time
 
 weaviate_client = weaviate.connect_to_local()
+atexit.register(weaviate_client.close)
 app = FastAPI()
 
 embedder = SentenceTransformer("all-MiniLM-L6-v2")
 
 conn = psycopg2.connect(
-    host="localhost", port=5432, dbname="postgres", user="postgres", password="devpassword"
+    host=os.environ.get("DB_HOST", "localhost"),
+    port=int(os.environ.get("DB_PORT", "5432")),
+    dbname=os.environ.get("DB_NAME", "postgres"),
+    user=os.environ.get("DB_USER", "postgres"),
+    password=os.environ.get("DB_PASSWORD", "devpassword"),
 )
 register_vector(conn)  # teaches psycopg2 how to send Python vectors to Postgres's vector column
 
@@ -91,7 +97,11 @@ evidence_items = [
     EvidenceItem("electromart", "T1", "Customer's account has two prior disputes marked as customer error, both resolved without refund."),
     EvidenceItem("electromart", "T2", "No delivery confirmation on file for this order."),
     EvidenceItem("subscribebox", "T3", "Order history shows only one charge of ₹50 on this date — no duplicate found."),
-    EvidenceItem("subscribebox", "T4", "Delivery confirmed via courier tracking SBX882, signed for at the customer's registered address on Aug 15.")
+    EvidenceItem("subscribebox", "T4", "Delivery confirmed via courier tracking SBX882, signed for at the customer's registered address on Aug 15."),
+    EvidenceItem("gizmohub", "T5", "Screen protector shipped via CourierX, delivered Aug 6, confirmed by tracking GZ1001."),
+    EvidenceItem("gizmohub", "T6", "USB-C cable order confirmed delivered Aug 7 per tracking GZ1002."),
+    EvidenceItem("gizmohub", "T7", "Phone case delivery confirmed Aug 8, signed for at billing address, tracking GZ1003."),
+    EvidenceItem("gizmohub", "T8", "Premium wireless earbuds order placed Aug 10 — no delivery confirmation on file yet, shipment still in transit per carrier tracking GZ1004."),
 ]
 
 # a tiny pretend database, standing in for real records
@@ -100,6 +110,10 @@ transactions = [
     Transaction("T2","electromart", 1200, date(2026, 8, 10), delivered=False, delivery_address_matches_billing=False),
     Transaction("T3","subscribebox", 50, date(2026, 8, 12), delivered=True, delivery_address_matches_billing=True),
     Transaction("T4","subscribebox", 800, date(2026, 8, 15), delivered=True, delivery_address_matches_billing=True),
+    Transaction("T5", "gizmohub", 300, date(2026, 8, 6), delivered=True, delivery_address_matches_billing=True),
+    Transaction("T6", "gizmohub", 280, date(2026, 8, 7), delivered=True, delivery_address_matches_billing=True),
+    Transaction("T7", "gizmohub", 320, date(2026, 8, 8), delivered=True, delivery_address_matches_billing=True),
+    Transaction("T8", "gizmohub", 8500, date(2026, 8, 10), delivered=False, delivery_address_matches_billing=False),
     ]
 
 import statistics
@@ -579,8 +593,6 @@ def main():
     # print("weaviate:", retrieve_evidence_weaviate("what about tracking TRK556", "electromart", "T1", top_k=2))
     # print("pgvector:", benchmark(retrieve_evidence_semantic, "what about tracking TRK556", "electromart", "T1", top_k=2));
     # print("weaviate:", benchmark(retrieve_evidence_weaviate, "what about tracking TRK556", "electromart", "T1", top_k=2));
-    weaviate_client.close()
-    conn.close()
 
 if __name__ == "__main__":
     main()

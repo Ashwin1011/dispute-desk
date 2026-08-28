@@ -54,6 +54,15 @@ GOLDEN_CASES = [
         "evidence_empty": True, "is_anomaly": False, "escalate_for_review": True,
         "reason": "product_not_received", "approved": False, "submitted": False,
     },
+    },
+    {
+    "id": "T8-gizmohub-fraud-anomaly",
+    "customer_message": "I never received these earbuds and this charge seems way higher than my usual orders.",
+    "tenant_id": "gizmohub",
+    "transaction_id": "T8",
+    # First real run for this case — is_anomaly is guaranteed by the math above,
+    # but confirm `reason` and `escalate_for_review` from actual output.
+    "expected": {"evidence_empty": False, "is_anomaly": True, "escalate_for_review": True, "reason": "product_not_received"},
     }
 ]
 

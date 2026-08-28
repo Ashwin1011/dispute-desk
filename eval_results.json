@@ -68,5 +68,19 @@
     "passed": true,
     "hard_mismatches": [],
     "soft_mismatches": []
+  },
+  {
+    "id": "T8-gizmohub-fraud-anomaly",
+    "actual": {
+      "evidence_empty": false,
+      "is_anomaly": true,
+      "reason": "product_not_received",
+      "escalate_for_review": true,
+      "approved": null,
+      "submitted": null
+    },
+    "passed": true,
+    "hard_mismatches": [],
+    "soft_mismatches": []
   }
 ]

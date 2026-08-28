@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+      POSTGRES_PASSWORD: ${{ secrets.DB_PASSWORD }}
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start Weaviate (docker run, not services: — see PR/commit notes on why)
+        run: |
+          docker run -d --name weaviate \
+            -p 8080:8080 -p 50051:50051 \
+            -e AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED=true \
+            -e ENABLE_MODULES='' \
+            -e CLUSTER_HOSTNAME=node1 \
+            cr.weaviate.io/semitechnologies/weaviate:1.39.0 \
+            --host 0.0.0.0 --port 8080 --scheme http
+
+      - name: Wait for Weaviate to be ready
+        run: |
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8080/v1/.well-known/ready && exit 0
+            sleep 2
+          done
+          echo "Weaviate never became ready" && exit 1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Apply database schema
+        run: PGPASSWORD="$DB_PASSWORD" psql -h localhost -U postgres -d postgres -f schema.sql
+
+      - name: Seed evidence (Postgres + Weaviate)
+        run: uv run python seed_evidence.py
+
+      - name: Permission-boundary test suite (84 cases)
+        run: uv run pytest tests/test_permission_boundary.py -v
+
+      - name: Golden-dataset evaluation
+        run: uv run python eval_golden.py
+
+      - name: Upload eval results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-results
+          path: eval_results.json
