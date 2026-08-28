@@ -13,7 +13,7 @@ from pgvector.psycopg2 import register_vector
 from anthropic_api_call import client
 from anthropic.types import Message, TextBlock
 from fastapi import FastAPI
-import statistics
+# import statistics
 import json
 import weaviate
 from weaviate.classes.config import Configure, DataType, Property
