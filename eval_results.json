@@ -5,7 +5,9 @@
       "evidence_empty": false,
       "is_anomaly": false,
       "reason": "unrecognized",
-      "escalate_for_review": false
+      "escalate_for_review": false,
+      "approved": null,
+      "submitted": true
     },
     "passed": true,
     "hard_mismatches": [],
@@ -17,7 +19,9 @@
       "evidence_empty": true,
       "is_anomaly": false,
       "reason": "product_not_received",
-      "escalate_for_review": true
+      "escalate_for_review": true,
+      "approved": null,
+      "submitted": null
     },
     "passed": true,
     "hard_mismatches": [],
@@ -29,7 +33,9 @@
       "evidence_empty": true,
       "is_anomaly": false,
       "reason": "product_not_received",
-      "escalate_for_review": true
+      "escalate_for_review": true,
+      "approved": null,
+      "submitted": null
     },
     "passed": true,
     "hard_mismatches": [],
@@ -41,7 +47,23 @@
       "evidence_empty": false,
       "is_anomaly": false,
       "reason": "duplicate",
-      "escalate_for_review": false
+      "escalate_for_review": false,
+      "approved": null,
+      "submitted": true
+    },
+    "passed": true,
+    "hard_mismatches": [],
+    "soft_mismatches": []
+  },
+  {
+    "id": "human-rejects-escalated-draft",
+    "actual": {
+      "evidence_empty": true,
+      "is_anomaly": false,
+      "reason": "product_not_received",
+      "escalate_for_review": true,
+      "approved": false,
+      "submitted": false
     },
     "passed": true,
     "hard_mismatches": [],

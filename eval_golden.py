@@ -1,5 +1,7 @@
 import json
 from disputedesk import app_graph
+from langchain_core.runnables import RunnableConfig
+from langgraph.types import Command
 
 GOLDEN_CASES = [
     {
@@ -42,10 +44,21 @@ GOLDEN_CASES = [
         # entry rather than assuming I got it right.
         "expected": {"evidence_empty": False, "is_anomaly": False, "escalate_for_review": False, "reason": "duplicate"},
     },
+    {
+    "id": "human-rejects-escalated-draft",
+    "customer_message": "what about tracking TRK556",
+    "tenant_id": "subscribebox",
+    "transaction_id": "TRK556",
+    "resume_approved": False,
+    "expected": {
+        "evidence_empty": True, "is_anomaly": False, "escalate_for_review": True,
+        "reason": "product_not_received", "approved": False, "submitted": False,
+    },
+    }
 ]
 
 def run_case(case: dict) -> dict:
-    config = {"configurable": {"thread_id": f"eval-{case['id']}"}}
+    config = RunnableConfig(configurable={"thread_id": f"eval-{case['id']}"})
     result = app_graph.invoke(
         {
             "customer_message": case["customer_message"],
@@ -57,6 +70,10 @@ def run_case(case: dict) -> dict:
         },
         config=config,
     )
+
+    if "__interrupt__" in result and "resume_approved" in case:
+        result = app_graph.invoke(Command(resume={"approved": case["resume_approved"]}), config=config)
+
     evidence = result.get("evidence") or []
     fraud_flag = result.get("fraud_flag")
     draft = result.get("draft")
@@ -66,12 +83,14 @@ def run_case(case: dict) -> dict:
         "is_anomaly": fraud_flag.is_anomaly if fraud_flag else None,
         "reason": draft.reason if draft else None,
         "escalate_for_review": critic_verdict.escalate_for_review if critic_verdict else None,
+        "approved": result.get("approved"),
+        "submitted": result.get("submitted"),
     }
 
 
 def score_case(case: dict, actual: dict) -> dict:
     expected = case["expected"]
-    hard_fields = ("evidence_empty", "is_anomaly", "escalate_for_review")
+    hard_fields = [f for f in ("evidence_empty", "is_anomaly", "escalate_for_review", "approved", "submitted") if f in expected]
     hard_mismatches = [
         f"{f}: expected {expected[f]}, got {actual[f]}"
         for f in hard_fields if actual[f] != expected[f]
@@ -104,7 +123,7 @@ def main():
     if passed < len(results):
         raise SystemExit(1)
 
-    
+
 
 if __name__ == "__main__":
     main()
