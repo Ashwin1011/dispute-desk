@@ -6,7 +6,7 @@ from langgraph.graph import StateGraph, END, START
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.runnables import RunnableConfig
 from langgraph.types import interrupt, Command
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from sentence_transformers import SentenceTransformer
 import psycopg2
 from pgvector.psycopg2 import register_vector
@@ -325,12 +325,21 @@ IMPORTANT: evidence_cited must contain exact, verbatim copies of the evidence li
 You may reference the policy context above in your draft text for framing, but evidence_cited must only ever list items from the evidence section — never from the policy context.
 Rate your confidence. Respond with ONLY valid JSON matching this shape:
 {{"reason": "...", "evidence_cited": [...], "draft_text": "...", "confidence": 0.0}}"""
-    response = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=300,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return DraftResponse.model_validate_json(parse_model_json(message_text(response)))
+
+    for attempt in range(2):
+        try:
+            response = client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=300,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return DraftResponse.model_validate_json(parse_model_json(message_text(response)))
+        except ValidationError as e:
+            continue
+
+    # If we've tried twice and still can't generate a valid response, route to human review
+    return DraftResponse(reason="unrecognized", evidence_cited=[], draft_text="Unable to generate a validated response for this dispute automatically — routed to human review.", confidence=0.0)
+
 
 
 def fraud_node(state: DisputeState, config: RunnableConfig) -> dict:
