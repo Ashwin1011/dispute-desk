@@ -25,6 +25,9 @@ import atexit
 
 load_dotenv()
 
+MODEL_STRONG = "claude-sonnet-4-6"
+MODEL_CHEAP = "claude-haiku-4-5-20251001"
+
 tavily_client = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
 import time
 
@@ -329,7 +332,7 @@ Rate your confidence. Respond with ONLY valid JSON matching this shape:
     for attempt in range(2):
         try:
             response = client.messages.create(
-                model="claude-sonnet-4-6",
+                model=MODEL_STRONG,
                 max_tokens=300,
                 messages=[{"role": "user", "content": prompt}],
             )
@@ -409,7 +412,7 @@ def classify_dispute_reason(customer_message: str) -> str:
     Respond with ONLY the category name, nothing else."""
 
     response = client.messages.create(
-        model="claude-sonnet-4-6",
+        model=MODEL_CHEAP,
         max_tokens=20,
         messages=[{"role": "user", "content": prompt}],
     )
