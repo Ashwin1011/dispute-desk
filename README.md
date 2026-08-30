@@ -4,7 +4,7 @@ A payment-dispute / chargeback copilot. A LangGraph pipeline retrieves evidence 
 
 Evidence, fraud scoring, and MCP calls are **scoped to a tenant**. A tenant cannot retrieve another tenant's evidence or score fraud on another tenant's transactions.
 
-**Current milestone:** the full `retrieve ∥ fraud → [policy_lookup] → draft → critic → conditional HITL → submit → audit-log` pipeline is built, checkpointed, and shipped as an MCP server — verified live from Cursor, including a real human-rejection path. Retrieval and fraud checking are tenant-scoped across three synthetic tenants, retrieval is **hybrid** (Postgres full-text keyword search fused with pgvector semantic search via Reciprocal Rank Fusion), a fourth retrieval path (Weaviate, run locally via Docker, seeded with identical embeddings) has been measured against pgvector as a documented comparison experiment — not adopted, pgvector remains the live path — and when local evidence comes back empty, a **Tavily policy lookup** now feeds real external card-network reason-code content into the draft instead of drafting blind, with a deliberate, structural escalation rule ensuring a policy-only draft always reaches a human. All four retrieval methods, plus fraud checking, are covered by an 86/86-passing automated cross-tenant test suite, a 6-case golden-dataset regression eval, and a formal prompt-injection red-team suite — all three CI-gated on every push. See *Known limitations* and *What's next* below before treating any part of this as finished.
+**Current milestone:** the full `retrieve ∥ fraud → [policy_lookup] → draft → critic → conditional HITL → submit → audit-log` pipeline is built, checkpointed, and shipped as **both** an MCP server and a FastAPI REST API — verified live from Cursor and via direct HTTP calls, including a real human-rejection path. Retrieval and fraud checking are tenant-scoped across three synthetic tenants, retrieval is **hybrid** (Postgres full-text keyword search fused with pgvector semantic search via Reciprocal Rank Fusion), a fourth retrieval path (Weaviate, run locally via Docker, seeded with identical embeddings) has been measured against pgvector as a documented comparison experiment — not adopted, pgvector remains the live path — and when local evidence comes back empty, a **Tavily policy lookup** now feeds real external card-network reason-code content into the draft instead of drafting blind, with a deliberate, structural escalation rule ensuring a policy-only draft always reaches a human. All four retrieval methods, plus fraud checking, are covered by an 86/86-passing automated cross-tenant test suite, a 6-case golden-dataset regression eval, and a formal prompt-injection red-team suite — all three CI-gated on every push. **`v6` (production deployment) is underway, not finished:** cost-aware model routing (`MODEL_STRONG`/`MODEL_CHEAP`), the REST API, single-image/two-entrypoint Docker packaging with a three-service `docker-compose.yml`, and end-to-end Langfuse tracing are all built and verified locally — see *REST API*, *Observability*, and *Deployment* below. Deploying to Fly.io, uptime/cost alerting, and a maintenance runbook are still ahead. See *Known limitations* and *What's next* below before treating any part of this as finished.
 
 > **Note on version numbers below:** the `v0`–`v5.x` tags in this file are this project's own chronological build order, not the phase numbers from the project's planning docs. There, `v4` names the whole multi-agent + MCP milestone, and `v5` names a golden-dataset eval + CI-gated regression + formal red-team suite — what this file calls `v5` (tenant isolation) was really closing a permission-boundary gap the original plan scoped under `v3`. That real `v5` (golden eval, CI gate, red-team suite) is now built too, labeled `v5.4` below since it landed after tenant isolation chronologically. Flagging this so the two numbering schemes don't read as contradictory.
 
@@ -75,7 +75,7 @@ pgvector is consistently faster by roughly 1.4 ms (~13%) — real and reproducib
 
 Fires only when `retrieve`'s output was empty — the fallback for the fallback: local RAG found nothing, so drop to an external source rather than draft blind. `route_after_retrieve` checks `len(state["evidence"]) == 0` and conditionally routes to `policy_lookup` instead of straight to `draft`.
 
-`classify_dispute_reason` is a cheap Claude call (`max_tokens=20`) that reuses the exact same `reason` taxonomy `DraftResponse` already has — `unrecognized | product_not_received | duplicate | product_unacceptable` — rather than inventing a second classification scheme just to build a search query. That category is mapped through a small static `REASON_TO_SEARCH_PHRASE` dict to a normalized phrase (e.g. `"duplicate processing chargeback reason code"`) before it ever reaches Tavily. That mapping is safe to hardcode — dispute-category vocabulary is stable, official card-network terminology, not something that goes stale — unlike the actual policy content, which stays live, fetched fresh from Tavily every time.
+`classify_dispute_reason` is a cheap Claude call (`max_tokens=20`, pinned to `MODEL_CHEAP` — `claude-haiku-4-5` — as of v6) that reuses the exact same `reason` taxonomy `DraftResponse` already has — `unrecognized | product_not_received | duplicate | product_unacceptable` — rather than inventing a second classification scheme just to build a search query. That category is mapped through a small static `REASON_TO_SEARCH_PHRASE` dict to a normalized phrase (e.g. `"duplicate processing chargeback reason code"`) before it ever reaches Tavily. That mapping is safe to hardcode — dispute-category vocabulary is stable, official card-network terminology, not something that goes stale — unlike the actual policy content, which stays live, fetched fresh from Tavily every time.
 
 **Why not just search the raw customer message?** Tried that first. A raw complaint ("I have a duplicate charge on my card, I never ordered anything.") returned generic consumer-facing "what is a chargeback" explainers (Bankrate, Discover) — a web search reads a first-person conversational sentence very differently from a normalized topic phrase. Classifying first and searching a clean category phrase (`"Visa Mastercard duplicate processing chargeback reason code"`) instead returned specific, citable reason-code content (Visa 12.6 / Mastercard 4834) — a measured before/after on the same customer message, not an assumed improvement.
 
@@ -86,6 +86,8 @@ Fires only when `retrieve`'s output was empty — the fallback for the fallback:
 ### Fraud (`fraud_node` / v3.3, tenant-scoped in v5)
 
 `check_fraud_signals(tenant_id, transaction_id)` looks up the fixture `Transaction` **among that tenant's rows only** and computes a z-score of its `amount` against that tenant's amounts (`statistics.mean` / `pstdev`). If the id is missing for that tenant, it returns `note="transaction not found for this tenant"` and does not score another merchant's order.
+
+**v6: the tenant-scoped lookup is now a shared helper, not duplicated.** `get_transaction(tenant_id, transaction_id)` was extracted from what used to be inline logic here — it's the same lookup the new REST API now uses to return a `404` before ever invoking the graph (see *REST API*), rather than re-implementing "find this tenant's transaction by id" in two places. `check_fraud_signals` calls `get_transaction` for the single-transaction lookup, then separately re-derives the full `tenant_txs` list for the mean/stdev population — deliberately not a second helper, since that population lookup is a different query (all of a tenant's transactions, not one).
 
 If `|z| > 1.5`, `is_anomaly` is true and the note says the amount is flagged for review.
 
@@ -104,7 +106,7 @@ Output is `FraudFlag(z_score, is_anomaly, note)`.
 
 ### Draft (`draft_node` / v3–v3.2, policy-aware and verbatim-citation-strict in v5.3)
 
-`draft_from_evidence` sends the message, the retrieved bullets, and (when present) `policy_context` to Claude (`claude-sonnet-4-6`). The model must return JSON only:
+`draft_from_evidence` sends the message, the retrieved bullets, and (when present) `policy_context` to Claude (`MODEL_STRONG` — `claude-sonnet-4-6`, as of v6). The model must return JSON only:
 
 ```json
 {
@@ -116,6 +118,8 @@ Output is `FraudFlag(z_score, is_anomaly, note)`.
 ```
 
 Markdown fences around the JSON are stripped (`parse_model_json`). Only Anthropic `TextBlock`s are read (`message_text`). Pydantic (`DraftResponse`) validates the object.
+
+**v6: cost-aware model routing, reasoned from this pipeline's actual shape.** `MODEL_STRONG` (`claude-sonnet-4-6`) and `MODEL_CHEAP` (`claude-haiku-4-5`) are named constants so the routing decision lives in one place rather than as scattered string literals. `draft_from_evidence` stays on `MODEL_STRONG` — it's the one call that has to reason over evidence, policy context, and reply wording together. `classify_dispute_reason` (see *Policy lookup*) moved to `MODEL_CHEAP` — a `max_tokens=20` classification into a four-value enum doesn't need the strong model. A generic "cheap for routine calls, strong for the critic" split doesn't map onto this architecture, since `critic_node`'s grounding check is pure code, not a second LLM call — there is no second model-backed step to route independently.
 
 **`evidence_cited` must now be verbatim, not paraphrased — a real bug this project caught via its own regression testing, not a Tavily-specific fix.** Re-verifying a known-good, real-evidence case after adding `policy_lookup` (see *Critic* below for why that re-check mattered) surfaced a pre-existing gap: the model was paraphrasing citations by default — e.g. `"Courier tracking TRK556 shows delivered Aug 9, signed at the billing address."` cited back as `"Courier tracking TRK556 confirms delivery on Aug 9 with a signature at the billing address."` Same fact, faithfully represented, but `check_grounding`'s strict substring match (see *Critic*) rejected it as ungrounded — a false negative that would have needlessly escalated a routine, well-supported dispute to a human. The fix was in the prompt, not the check: `evidence_cited` and `draft_text` serve different purposes — one is machine-verified, one is customer-facing — and the prompt now says so explicitly, requiring exact character-for-character copies in `evidence_cited` while `draft_text` stays free to read naturally. Loosening `check_grounding` to fuzzy-match instead was considered and rejected — that would weaken the actual anti-hallucination guarantee; forcing verbatim citation keeps the check strict while removing the false-negative pressure.
 
@@ -201,6 +205,60 @@ Example: resolve T1 for tenant `electromart` with `"I never received this order.
 
 Cursor is configured in `.cursor/mcp.json`. The command is this project's **`.venv/bin/python`** with an absolute path to `mcp_server.py` — not bare `uv` / `python`. Cursor's GUI process does not inherit the shell PATH, so `spawn uv ENOENT` is what you get if the command is just `uv`, and `ECONNREFUSED ::1:8000` is what you get if the config accidentally points at an SSE/URL transport instead of a local stdio command.
 
+### REST API (`app` / v6)
+
+A second interface onto the same `app_graph`, alongside the MCP stdio server — same graph, same tenant scoping, same escalation logic; this is transport only, not new pipeline logic. Supersedes the old, still-commented-out v2 `POST /classify` route (see *Still in the file, not on the live path*).
+
+| Route | Method | Body | What it does |
+| --- | --- | --- | --- |
+| `/disputes` | POST | `{tenant_id, transaction_id, customer_message}` | Looks up the transaction with `get_transaction` first; returns `404` before ever invoking the graph if it's missing for that tenant. Otherwise `invoke`s with `thread_id=dispute-{tenant_id}-{transaction_id}`, same as MCP's `resolve_dispute`. Interrupted runs return `{status: "awaiting_approval", thread_id, draft_text, critic_notes}`; completed runs return `{status: "submitted"\|"rejected", thread_id, draft_text}`. |
+| `/disputes/{thread_id}/approve` | POST | `{approved: bool}` | `Command(resume={"approved": ...})` on that thread — mirrors MCP's `approve_dispute`. |
+
+**Deliberate MCP/REST asymmetry on cross-tenant or unknown-transaction requests.** MCP's `resolve_dispute` does not pre-check the transaction — a cross-tenant or nonexistent `transaction_id` still invokes the graph, comes back with zero evidence, and escalates via `no_case_evidence` (see *Critic*), the existing structural guarantee, unchanged. The REST route adds an explicit `get_transaction` check up front and returns a plain `404` instead of running the graph at all. Both are safe — neither ever returns another tenant's data — but they read differently at the boundary on purpose: a stdio tool consumed by an agent (MCP) is expected to reason about an `awaiting_approval` response, so letting it flow through the normal escalation path is the more useful shape there; a REST client asking "does this transaction exist" doesn't need a full graph run and a human-review payload just to be told no. Decided explicitly, not left as an oversight.
+
+Interactive docs at `/docs` (FastAPI's default Swagger UI) once the server is running — see *Run*.
+
+### Observability (Langfuse tracing / v6)
+
+`langfuse.langchain.CallbackHandler` is instantiated once (`langfuse_handler`) and attached to every `app_graph.invoke` call through a shared `make_config(thread_id)` helper — the same DRY pattern as `get_transaction` — replacing five separate `config: RunnableConfig = {"configurable": {"thread_id": thread_id}}` literals scattered across `disputedesk.py`, `mcp_server.py`, and the REST routes with one function:
+
+```python
+def make_config(thread_id: str) -> RunnableConfig:
+    return {"configurable": {"thread_id": thread_id}, "callbacks": [langfuse_handler]}
+```
+
+Verified live, not just wired up: a real run produced a complete node-by-node trace in the Langfuse dashboard — `LangGraph` → `fraud`/`retrieve` in parallel → `route_after_retrieve` → `draft` → `critic` → `route_after_critic` → `submit` — with per-node latency and the underlying Claude calls' token counts and cost visible individually.
+
+This is complementary to `log_decision`/`audit_log`, not a replacement for it. `audit_log` is this project's own durable business record — one JSON decision per node, queryable from Postgres, meant to answer "what did this dispute do and why," indefinitely. Langfuse is an operational tracing layer — LLM-call-level latency, token usage, and cost, meant to answer "is the pipeline healthy and what is it costing" — retained on Langfuse's infrastructure, not this project's database. Keeping both means losing Langfuse access (a lapsed account, a network issue) doesn't lose the audit trail, and vice versa.
+
+Requires `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, and `LANGFUSE_HOST` in `.env` (see *Setup*), and `langfuse` plus `langchain` as runtime dependencies — `langfuse.langchain.CallbackHandler` needs the separate `langchain` package installed, not just `langchain_core`/`langgraph`, which were already present for the graph itself. Never share `LANGFUSE_SECRET_KEY` outside `.env` — only the public key is safe to expose, the same distinction as a Stripe publishable vs. secret key.
+
+### Deployment (Docker / v6, in progress)
+
+One image, two entrypoints, selected by a `TRANSPORT` env var read in `entrypoint.sh`:
+
+```sh
+#!/bin/sh
+set -e
+if [ "$TRANSPORT" = "mcp" ]; then
+    exec python mcp_server.py
+else
+    exec uvicorn disputedesk:app --host 0.0.0.0 --port 8000
+fi
+```
+
+`docker-compose.yml` now runs three services on one shared network — `weaviate` (unchanged, see *Setup*), a new `postgres` (`pgvector/pgvector:pg16`), and a new `app` (built from this project's own `Dockerfile`) — reachable from `app` by service name (`DB_HOST=postgres`, `WEAVIATE_HOST=weaviate`) rather than `localhost`, standard Compose DNS.
+
+Three real bugs found bringing this up, not just a clean build on the first try:
+
+- **`weaviate.connect_to_local()` had `localhost` hardcoded.** Inside Compose's network, Weaviate is reachable at the service name `weaviate`, not `localhost` — fixed by reading a `WEAVIATE_HOST` env var (default `localhost`, so nothing outside Docker breaks): `weaviate.connect_to_local(host=os.environ.get("WEAVIATE_HOST", "localhost"))`.
+- **`vector type not found in the database`, which looked like a schema bug but wasn't one.** `schema.sql` already had `CREATE EXTENSION IF NOT EXISTS vector;` as its first line — the real cause was that this machine has no local `psql` client installed at all, so every earlier `psql -h localhost -f schema.sql` had silently never run. Fixed by applying the schema from inside the container instead, which never depends on a host-side client: `docker compose exec -T postgres psql -U postgres -d postgres < schema.sql`.
+- **`/entrypoint.sh: 7: exec: uvicorn: not found`, caused by a missing `.dockerignore`.** With no `.dockerignore`, `COPY . .` copies the host's own `.venv` into the image *after* `uv sync` already built a correct container-native one at the same path — on a Mac host, that silently overwrites Linux binaries with macOS-native ones (`.venv/bin/uvicorn` became a 352-byte script with a Mac shebang; `.venv/bin/python3` a broken symlink). Fixed by adding `.dockerignore` excluding `.venv`, `.git`, `__pycache__`, `.pytest_cache`, `.env`.
+
+**Open, not solved: the image pulls a full CUDA/`nvidia-*` dependency chain for a CPU-only app.** `torch`'s default PyPI Linux wheel declares `cuda-toolkit`/`nvidia-cudnn-cu13`/`nvidia-nccl-cu13`/`triton` as dependencies, adding several GB and minutes to every fresh build even though nothing here uses a GPU. Two fixes were tried and neither took effect: pinning `torch` to the CPU-only PyTorch index via `[tool.uv.sources]`/`[[tool.uv.index]]` in `pyproject.toml` (syntactically correct per uv's own docs, but `uv lock` never actually switched `torch`'s locked source away from `pypi.org/simple`); and `uv sync --no-install-package torch` plus a separate CPU-index `pip install torch` (excluded `torch` itself but not its CUDA-only transitive dependencies, which still downloaded anyway). Deferred rather than solved: the build works, and Docker's per-layer caching means the slow download only recurs when `pyproject.toml`/`uv.lock` actually change, not on every rebuild. See *Known limitations*.
+
+Not yet done: actual deployment (Fly.io is the target — see *What's next*), so none of this is live outside a local `docker compose up`.
+
 ### Reason codes
 
 | Reason                 | Meaning                                          |
@@ -212,7 +270,7 @@ Cursor is configured in `.cursor/mcp.json`. The command is this project's **`.ve
 
 ### Still in the file, not on the live path
 
-v1 `recommend_action` (contest / accept / needs_review from delivery flags) and v2 `classify_dispute` + FastAPI `POST /classify` are commented out. `tests/test_disputedesk.py` still targets `recommend_action` and will fail until that function is restored or those tests are updated.
+v1 `recommend_action` (contest / accept / needs_review from delivery flags) and v2 `classify_dispute` + FastAPI `POST /classify` are commented out — the FastAPI app object itself is very much live now, just serving v6's `/disputes` routes instead (see *REST API*). `tests/test_disputedesk.py` still targets `recommend_action` and will fail until that function is restored or those tests are updated.
 
 Fixture transactions T1–T4 remain in memory (each with a `tenant_id`). Evidence embeddings live in Postgres after a one-time seed (`uv run python seed_evidence.py`).
 
@@ -221,7 +279,7 @@ Fixture transactions T1–T4 remain in memory (each with a `tenant_id`). Evidenc
 Named here on purpose rather than left implicit — these are the honest edges of what's built so far, not things papered over:
 
 - **The fraud-anomaly escalation path can't currently fire.** With exactly two transactions per tenant, `check_fraud_signals`'s z-score is mathematically always `±1.0` (true for any 2-point population regardless of the actual amounts), which never crosses the `1.5` threshold. `is_anomaly` is real code, correctly scoped, but currently unreachable by the fixture data. A third transaction per tenant with a genuine outlier amount would restore a meaningful demo of that path — not done yet.
-- **`MemorySaver` is dev-only.** It doesn't survive a process restart, so an interrupted dispute can't currently be approved in a separate run from the one that started it — only within one live Python process. A persistent checkpointer (SQLite- or Postgres-backed) is a small, well-understood swap for later, not built yet.
+- **`MemorySaver` is dev-only — and this gets sharper the closer deployment gets.** It doesn't survive a process restart, so an interrupted dispute can't currently be approved in a separate run from the one that started it — only within one live Python process. A restart-happy platform (Fly.io machines can sleep or restart) would silently drop any dispute paused mid-approval once this is actually deployed. A persistent checkpointer (SQLite- or Postgres-backed) is a small, well-understood swap, and needs to land before `v6` is more than "runs correctly in a container locally" — not built yet.
 - **LangGraph logs a deserialization warning** for the custom Pydantic types (`FraudFlag`, `DraftResponse`, `CriticVerdict`) stored in checkpoints — a real, forward-looking security signal (LangGraph is moving toward blocking arbitrary-class deserialization from checkpoints by default). Deferred; the clean fix is storing `.model_dump()` dicts in state instead of raw model instances, not whitelisting class names.
 - **`audit_log` has a narrow theoretical race.** `retrieve` and `fraud` run in parallel and both write to `audit_log` through the same shared `conn` (each opens its own cursor, which mitigates but doesn't fully eliminate risk under a truly concurrent executor). Worth a connection pool before this is anything more than a demo.
 - **No customer-level fraud memory.** `FraudAnalyst` only looks at one transaction's amount, tenant-scoped — it has no notion of "this customer has filed three disputes this month," which is itself a real fraud signal. Not built.
@@ -230,10 +288,15 @@ Named here on purpose rather than left implicit — these are the honest edges o
 - **`check_grounding`'s exact-substring match is now load-bearing on prompt discipline, not just code correctness.** The verbatim-citation fix (see *Draft*) works because the prompt explicitly tells the model to copy evidence exactly — but the check itself is still a plain string match with no semantic tolerance. Any future prompt change that lets citations drift back into paraphrase (even accidentally, e.g. while tuning `draft_text` wording) will silently reintroduce the same false-negative escalation this project just found and fixed. Worth eventually replacing the substring check with something more robust than prompt discipline alone — not done yet. The empty-citation vacuous-truth gap this same function had (real evidence, nothing cited, trivially "grounded") is closed as of v5.4 — see *Critic*.
 - **Three of the five red-team cases haven't actually observed their guardrail firing.** `RT1`, `RT2`, `RT5` currently pass because the model declines the injected instruction, not because the fix was exercised under a real attempt. Only `RT3`/`RT4` (independent recomputation, not model-dependent) and the `test_grounding.py` unit tests are unconditional proof.
 - **`draft_text` has no grounding check against `policy_context`.** `check_grounding` only ever validates `evidence_cited` against internal case `evidence`, by design (see *Policy lookup*) — but that also means adversarial content embedded in a live Tavily result could steer the customer-facing wording in `draft_text` with nothing checking it, an indirect/second-order prompt-injection vector (OWASP LLM01) the red-team suite documents but can't exercise deterministically, since Tavily's results aren't attacker-controlled by the test suite. Not built.
+- **The Docker image is far larger than it needs to be.** The CPU-only PyTorch fix didn't take effect (see *Deployment*) — the image still pulls a full CUDA/`nvidia-*` dependency chain that's never exercised at runtime, since nothing here uses a GPU. Deferred, not solved.
+- **Docker and the REST API aren't yet exercised by CI.** `.github/workflows/ci.yml` still runs the pytest suites, golden eval, and red-team suite directly against `uv run` on the runner — it does not build the Docker image or hit the REST routes. A container-build/smoke-test CI job is a reasonable next addition, not done yet.
+- **`mcp_server.py`'s `resolve_dispute` omits `policy_context` from its initial state.** `run_dispute` (CLI) and the new REST `/disputes` route both seed `"policy_context": None` in the state dict passed to `app_graph.invoke`; `resolve_dispute` does not. Not yet confirmed whether LangGraph's `TypedDict` state tolerates the missing key gracefully or not — flagged, not fixed.
 
 ## What's next
 
-Per the original build plan: hybrid search (Postgres full-text + pgvector), the **Weaviate comparison experiment**, and the **Tavily policy-lookup fallback** are all **done** — see the *Retrieve*, *Weaviate comparison*, *Policy lookup*, and *Critic* sections above for what was actually measured and fixed (identical ranking at this scale, a real ~13% latency gap attributable mostly to client-protocol overhead, a real query-quality difference between raw-message and classified-category search, a real false-negative grounding bug found via regression testing, and a real accidental-vs-deliberate escalation gap closed) rather than just described. The project's actual `v5` is **also done**: a 6-case golden-dataset eval (`eval_golden.py`), CI-gated regression (both the 86-case permission-boundary suite and the golden eval run on every push), and a formal prompt-injection red-team suite (`redteam_suite.py`, see *Red-team suite* above) that found and closed a real vacuous-truth grounding bug along the way. `draft_from_evidence`'s missing error handling around schema-escape attempts is now closed (see *Draft*, v5.4). Next: `draft_text`'s remaining lack of a grounding check against `policy_context`, then `v6` — production deployment with monitoring and a maintenance runbook.
+Per the original build plan: hybrid search (Postgres full-text + pgvector), the **Weaviate comparison experiment**, and the **Tavily policy-lookup fallback** are all **done** — see the *Retrieve*, *Weaviate comparison*, *Policy lookup*, and *Critic* sections above for what was actually measured and fixed (identical ranking at this scale, a real ~13% latency gap attributable mostly to client-protocol overhead, a real query-quality difference between raw-message and classified-category search, a real false-negative grounding bug found via regression testing, and a real accidental-vs-deliberate escalation gap closed) rather than just described. The project's actual `v5` is **also done**: a 6-case golden-dataset eval (`eval_golden.py`), CI-gated regression (both the 86-case permission-boundary suite and the golden eval run on every push), and a formal prompt-injection red-team suite (`redteam_suite.py`, see *Red-team suite* above) that found and closed a real vacuous-truth grounding bug along the way. `draft_from_evidence`'s missing error handling around schema-escape attempts is now closed (see *Draft*, v5.4).
+
+`v6` (production deployment) is **underway, not finished.** Done so far: cost-aware model routing (`MODEL_STRONG`/`MODEL_CHEAP`), a FastAPI REST API alongside MCP (see *REST API*), single-image/two-entrypoint Docker packaging with `docker-compose.yml` orchestrating Postgres + Weaviate + the app itself (see *Deployment*), and end-to-end Langfuse tracing verified live with a real dashboard trace (see *Observability*). Remaining, roughly in order: deploy to Fly.io, add uptime/cost alerting, write a maintenance runbook. Carried over and still open, in no particular priority order: `draft_text`'s lack of a grounding check against `policy_context`, the Docker image's unresolved torch/CUDA bloat, `mcp_server.py`'s `resolve_dispute` missing `"policy_context": None` in its initial state, and CI not yet building or smoke-testing the Docker image or the REST routes — see *Known limitations* for all four.
 
 ## Python environment (`.venv`)
 
@@ -290,14 +353,19 @@ source .venv/bin/activate
 pip install -e ".[dev]"
 ```
 
-Create a `.env` in the project root (do not commit it):
+Create a `.env` in the project root (do not commit it — already covered by `.gitignore`):
 
 ```
 ANTHROPIC_API_KEY=your_key_here
 TAVILY_API_KEY=your_key_here
+LANGFUSE_PUBLIC_KEY=your_public_key_here
+LANGFUSE_SECRET_KEY=your_secret_key_here
+LANGFUSE_HOST=https://cloud.langfuse.com
 ```
 
 `TAVILY_API_KEY` is only needed for the `policy_lookup` fallback (empty-evidence disputes) — get a free-tier key at [tavily.com](https://tavily.com) (1,000 searches/month). `uv add tavily-python` adds the client.
+
+`LANGFUSE_*` keys are only needed for tracing (see *Observability*) — sign up free at [cloud.langfuse.com](https://cloud.langfuse.com). `LANGFUSE_PUBLIC_KEY` is safe to share the way a Stripe publishable key is; **never commit or paste `LANGFUSE_SECRET_KEY` anywhere outside `.env`.** `uv add langfuse langchain` adds the dependencies — `langchain` specifically because `langfuse.langchain.CallbackHandler` needs it as a runtime dependency, separately from `langchain_core`/`langgraph`.
 
 **Postgres + pgvector** must be running locally. The app connects as:
 
@@ -360,6 +428,17 @@ curl http://localhost:8080/v1/.well-known/ready   # empty 200 OK means it's up
 
 `uv add weaviate-client` adds the Python client. `seed_evidence.py` (above) seeds both Postgres and Weaviate from the same `evidence_items` list in one run — rerunning it recreates the Weaviate `Evidence` collection cleanly (`collections.delete` before `collections.create`), the same "reseed rather than patch" approach as the Postgres `TRUNCATE`.
 
+**Docker (all services, including the app itself — v6)** — an alternative to running Postgres/Weaviate locally and `disputedesk.py` directly; runs everything in containers instead. Needs `.env` populated as above (Compose passes those vars into the `app` service). See *Deployment* for what `Dockerfile`/`entrypoint.sh`/`docker-compose.yml` actually do and the real bugs hit getting here:
+
+```bash
+docker compose up -d --build
+docker compose exec -T postgres psql -U postgres -d postgres < schema.sql
+docker compose exec app uv run python seed_evidence.py
+curl http://localhost:8000/docs   # REST API is up
+```
+
+`TRANSPORT` defaults to REST (uvicorn on port 8000 inside the container); set `TRANSPORT=mcp` on the `app` service in `docker-compose.yml` to run the MCP stdio server in a container instead — not yet tested against this current, fixed image (only ever run against an earlier, broken one). The first build is slow — several minutes, due to `torch`'s CUDA dependency chain (see *Deployment* and *Known limitations*); rebuilds are fast unless `pyproject.toml`/`uv.lock` actually change.
+
 ## Run
 
 **CLI** — `main()` runs electromart T1: retrieve ∥ fraud → draft → critic, then either auto-submit or pause + resume:
@@ -382,11 +461,28 @@ To run the server by hand (same interpreter the MCP config uses):
 .venv/bin/python mcp_server.py
 ```
 
-**API** — `POST /classify` is commented out. To serve it again, uncomment the FastAPI route and:
+**REST API (v6)** — `/disputes` and `/disputes/{thread_id}/approve` are live now (see *REST API*); the old v2 `POST /classify` route is still commented out and superseded. Run locally:
 
 ```bash
 uv run uvicorn disputedesk:app --reload
 ```
+
+or via Docker (`docker compose up -d --build app`, see *Setup*). Then:
+
+```bash
+curl -X POST http://localhost:8000/disputes \
+  -H "Content-Type: application/json" \
+  -d '{"tenant_id": "electromart", "transaction_id": "T1", "customer_message": "I never received this order."}'
+```
+
+Escalated responses include a `thread_id`; resume with:
+
+```bash
+curl -X POST http://localhost:8000/disputes/{thread_id}/approve \
+  -H "Content-Type: application/json" -d '{"approved": true}'
+```
+
+Swagger docs at `http://localhost:8000/docs`.
 
 **Golden-dataset eval** — needs the same live Postgres + Weaviate + API keys as the CLI/MCP paths:
 
@@ -422,10 +518,13 @@ This suite proves tenant data can't leak — it does not test adversarial *messa
 
 | File                                 | Role                                                                                             |
 | ------------------------------------ | ------------------------------------------------------------------------------------------------ |
-| `disputedesk.py`                     | Models, tenant-scoped pgvector retrieve, fraud z-score, Claude draft, critic, HITL, LangGraph    |
-| `mcp_server.py`                      | MCP stdio server: `resolve_dispute` / `approve_dispute` wrap `app_graph`                         |
+| `disputedesk.py`                     | Models, tenant-scoped pgvector retrieve, fraud z-score, cost-routed Claude draft (`MODEL_STRONG`/`MODEL_CHEAP`), critic, HITL, LangGraph, FastAPI REST routes, Langfuse tracing (`make_config`) |
+| `mcp_server.py`                      | MCP stdio server: `resolve_dispute` / `approve_dispute` wrap `app_graph`, both via the shared `make_config` helper |
 | `seed_evidence.py`                   | One-time insert of fixture evidence rows (tenant_id + embedding) into Postgres **and** Weaviate  |
-| `docker-compose.yml`                 | Local Weaviate container (comparison experiment only, not required for the main pipeline)        |
+| `docker-compose.yml`                 | Three services on one network — Weaviate, Postgres, and the app itself (v6, see *Deployment*)    |
+| `Dockerfile`                         | Single image build: `uv sync --frozen --no-dev`, then `COPY . .` with the venv on `PATH` (v6)     |
+| `entrypoint.sh`                      | Picks MCP stdio vs. REST uvicorn based on the `TRANSPORT` env var (v6)                            |
+| `.dockerignore`                      | Excludes `.venv`, `.git`, `__pycache__`, `.pytest_cache`, `.env` from the Docker build context (v6) |
 | `.cursor/mcp.json`                   | Cursor MCP config (absolute `.venv/bin/python` + `mcp_server.py`)                                |
 | `anthropic_api_call.py`              | Anthropic client (`ANTHROPIC_API_KEY` from `.env`)                                               |
 | `run`                                | Wrapper that always uses `.venv/bin/python`                                                      |
@@ -481,3 +580,5 @@ This suite proves tenant data can't leak — it does not test adversarial *messa
 **v5.4** — The project's real `v5`: golden-dataset eval, CI-gated regression, and a formal red-team suite. Added a third tenant, `gizmohub` (`T5`-`T8`), with a genuine 4-transaction population and one real outlier (`T8`, z≈1.73) — the first fixture data where the fraud-anomaly path actually fires end to end, closing a limitation open since `v5`. `eval_golden.py` added a 6-case golden dataset (clean auto-submits, a cross-tenant escalation, a Tavily-fallback escalation, an HITL-rejection path, and the new fraud-anomaly case); `.github/workflows/ci.yml` now runs it, plus the permission-boundary suite (grown from 24 to 86 cases across the new tenant), on every push. Along the way, an attempt to sanity-check the CI gate itself (commenting out `import statistics` to see if anything would catch it) turned out inconclusive — the file had a second, redundant `import statistics` elsewhere that kept working, so nothing was actually broken. The real, independent gap underneath that confound was genuine: every fraud test was a wrong-tenant case that returns before `statistics.mean`/`pstdev` ever runs. Fixed by removing the duplicate import and adding `test_fraud_check_works_for_correct_tenant` and `test_fraud_check_flags_real_anomaly`, direct unit tests of the real computation. Then `redteam_suite.py` formalized adversarial testing proper (OWASP LLM01-style prompt injection): five cases, each verified independently against ground truth rather than trusting the app's own checks. `RT1` found a real bug this way — `check_grounding`'s `all(...)` over an empty `evidence_cited` list was vacuously `True`, so a draft that cited nothing at all technically passed grounding even with real evidence on file; closed by making `check_grounding` return `False` outright when evidence exists but nothing was cited, which folds into the existing retry-then-escalate logic rather than needing a new rule (see *Critic*). `RT5` surfaced a real gap at this point: an out-of-taxonomy reason code, if the model complies with the injected instruction to emit one, raises an uncaught `pydantic.ValidationError` that crashes the whole graph invocation — no graceful degradation yet (closed in the follow-up `v5.4` entry immediately below, via *Draft*). `RT3`/`RT4` confirmed by direct, independent recomputation that the fraud math and the tenant boundary are both structurally immune to message-content manipulation, as designed. (v5.4 complete — see *Known limitations* and *What's next* for what's still open.)
 
 **v5.4** — Closed the fraud-test coverage gap and built a formal prompt-injection red-team suite. `tests/test_permission_boundary.py` grew from 84 to 86 cases: every prior fraud test only exercised the wrong-tenant early-return path, leaving `check_fraud_signals`'s real `statistics.mean`/`pstdev` computation completely uncovered — a duplicate `import statistics` had also made an earlier attempt to sanity-check this inconclusive (commenting out one copy left the other working, so nothing was actually broken). Fixed by removing the duplicate import and adding `test_fraud_check_works_for_correct_tenant` and `test_fraud_check_flags_real_anomaly`. Separately, `redteam_suite.py` formalized adversarial testing (OWASP LLM01-style prompt injection): five cases, each verified independently against ground truth rather than trusting the app's own checks. Found and closed a real bug this way — `check_grounding`'s `all(...)` over an empty `evidence_cited` list was vacuously `True`, so a draft that cited nothing at all technically passed grounding even with real evidence on file (`RT1`); fixed by making `check_grounding` return `False` outright in that case, which folds into the existing retry-then-escalate logic. `RT3`/`RT4` confirmed by independent recomputation that the fraud math and tenant boundary are structurally immune to message-content manipulation. `RT5` surfaced a real gap: an out-of-taxonomy reason code, if the model complies with an injected instruction to emit one, raised an uncaught `pydantic.ValidationError` that crashed the graph invocation — closed separately by adding a retry-then-safe-degrade path in `draft_from_evidence` (falls back to a `DraftResponse` with `evidence_cited=[]`, which the `check_grounding` fix above automatically routes to escalation — no new escalation logic needed). A dedicated `tests/test_grounding.py` unit-tests `check_grounding` directly and deterministically, independent of whether the model happens to comply with any given injection attempt. Three of the five red-team cases (`RT1`, `RT2`, `RT5`) pass because the model currently resists the injected instructions rather than because the guardrails have been observed catching a live attempt — a materially weaker claim than "5/5 passing" sounds like, worth stating precisely. (v5.4 complete.)
+
+**v6 (in progress)** — Production deployment groundwork: cost-aware model routing, a FastAPI REST API, Docker packaging, and Langfuse tracing. `MODEL_STRONG`/`MODEL_CHEAP` constants route `classify_dispute_reason` (the policy-lookup classification call) onto the cheap model (`claude-haiku-4-5`) and `draft_from_evidence` onto the strong model (`claude-sonnet-4-6`) — reasoned from the actual architecture rather than applied by rote, since `critic_node` is pure code, not a second LLM call, so a generic "cheap for routine, strong for the critic" split doesn't map onto this pipeline. Extracted `get_transaction(tenant_id, transaction_id)` out of what used to be inline logic in `check_fraud_signals`, so the new REST API can do the same tenant-scoped existence check before ever invoking the graph (see *REST API* for why MCP and REST deliberately handle a missing/cross-tenant transaction differently). Added two FastAPI routes (`POST /disputes`, `POST /disputes/{thread_id}/approve`) on the existing, previously-unused `app = FastAPI()` object, exercising the same `app_graph` as MCP. Containerized as one image with two entrypoints selected by a `TRANSPORT` env var (`entrypoint.sh`), orchestrated via an extended `docker-compose.yml` (Weaviate + Postgres + the app, one shared network). Wired `langfuse.langchain.CallbackHandler` through a new `make_config(thread_id)` helper that replaced five duplicated `RunnableConfig` literals across `disputedesk.py` and `mcp_server.py` — verified live with a complete node-by-node trace in the Langfuse dashboard. Found and fixed three real infrastructure bugs getting Docker running (see *Deployment*): a hardcoded `weaviate.connect_to_local()` host, a "vector type not found" error actually caused by no local `psql` client rather than a schema bug, and a missing `.dockerignore` letting `COPY . .` silently overwrite the container's Linux `.venv` with the host's macOS one. Left open, not solved: the Docker image still pulls torch's full CUDA dependency chain despite two attempted fixes, `mcp_server.py`'s `resolve_dispute` is missing `"policy_context": None` in its initial state, and CI doesn't yet build or smoke-test the Docker image or the REST routes (see *Known limitations*). Still ahead: actual Fly.io deployment, uptime/cost alerting, and a maintenance runbook.

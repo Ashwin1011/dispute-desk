@@ -2,7 +2,7 @@ from mcp.server import MCPServer
 from langchain_core.runnables import RunnableConfig
 from langgraph.types import Command
 
-from disputedesk import app_graph
+from disputedesk import app_graph, make_config
 
 mcp = MCPServer("DisputeDesk")
 
@@ -14,7 +14,7 @@ def resolve_dispute(tenant_id: str, transaction_id: str, customer_message: str) 
     submit automatically; anomalous or ungrounded ones pause for human approval —
     call approve_dispute with the returned thread_id to complete those."""
     thread_id = f"dispute-{tenant_id}-{transaction_id}"
-    config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+    config = make_config(thread_id)
     result = app_graph.invoke({
         "customer_message": customer_message,
         "tenant_id": tenant_id,
@@ -25,6 +25,7 @@ def resolve_dispute(tenant_id: str, transaction_id: str, customer_message: str) 
         "critic_verdict": None,
         "approved": None,
         "submitted": None,
+        "policy_context": None,
     }, config=config)
 
     if "__interrupt__" in result:
@@ -46,7 +47,7 @@ def resolve_dispute(tenant_id: str, transaction_id: str, customer_message: str) 
 @mcp.tool()
 def approve_dispute(thread_id: str, approved: bool) -> dict:
     """Resume a dispute paused by resolve_dispute, with a human's approval decision."""
-    config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+    config = make_config(thread_id)
     result = app_graph.invoke(Command(resume={"approved": approved}), config=config)
     return {
         "status": "submitted" if result["submitted"] else "rejected",

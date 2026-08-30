@@ -12,7 +12,7 @@ import psycopg2
 from pgvector.psycopg2 import register_vector
 from anthropic_api_call import client
 from anthropic.types import Message, TextBlock
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 import statistics
 import json
 import weaviate
@@ -23,7 +23,11 @@ import os
 from dotenv import load_dotenv
 import atexit
 
+
 load_dotenv()
+
+from langfuse.langchain import CallbackHandler
+langfuse_handler = CallbackHandler()
 
 MODEL_STRONG = "claude-sonnet-4-6"
 MODEL_CHEAP = "claude-haiku-4-5-20251001"
@@ -31,7 +35,7 @@ MODEL_CHEAP = "claude-haiku-4-5-20251001"
 tavily_client = TavilyClient(api_key=os.environ["TAVILY_API_KEY"])
 import time
 
-weaviate_client = weaviate.connect_to_local()
+weaviate_client = weaviate.connect_to_local(host=os.environ.get("WEAVIATE_HOST", "localhost"))
 atexit.register(weaviate_client.close)
 app = FastAPI()
 
@@ -66,6 +70,9 @@ def log_decision(thread_id: str, transaction_id: str, node_name: str, decision: 
             (thread_id, transaction_id, node_name, json.dumps(decision)),
         )
     conn.commit()
+
+def make_config(thread_id: str) -> RunnableConfig:
+    return {"configurable": {"thread_id": thread_id}, "callbacks": [langfuse_handler]}
 
 def get_thread_id(config: RunnableConfig) -> str:
     configurable = config.get("configurable")
@@ -119,17 +126,21 @@ transactions = [
     Transaction("T8", "gizmohub", 8500, date(2026, 8, 10), delivered=False, delivery_address_matches_billing=False),
     ]
 
+def get_transaction(tenant_id: str, transaction_id: str) -> Transaction | None:
+    tenant_txs = [t for t in transactions if t.tenant_id == tenant_id]
+    return next((t for t in tenant_txs if t.id == transaction_id), None)
+
 class FraudFlag(BaseModel):
     z_score: float
     is_anomaly: bool
     note: str
 
 def check_fraud_signals(tenant_id: str, transaction_id: str) -> FraudFlag:
-    tenant_txs = [t for t in transactions if t.tenant_id == tenant_id]
-    tx = next((t for t in tenant_txs if t.id == transaction_id), None)
+    tx = get_transaction(tenant_id, transaction_id)
     if tx is None:
         return FraudFlag(z_score=0.0, is_anomaly=False, note="transaction not found for this tenant")
 
+    tenant_txs = [t for t in transactions if t.tenant_id == tenant_id]
     amounts = [t.amount for t in tenant_txs]
     mean = statistics.mean(amounts)
     stdev = statistics.pstdev(amounts) or 1.0  # guard divide-by-zero if all amounts match
@@ -470,6 +481,63 @@ graph.add_edge("submit", END)
 checkpointer = MemorySaver()
 app_graph = graph.compile(checkpointer=checkpointer)
 
+
+class DisputeRequest(BaseModel):
+    tenant_id: str
+    transaction_id: str
+    customer_message: str
+
+
+class ApprovalRequest(BaseModel):
+    approved: bool
+
+
+@app.post("/disputes")
+def submit_dispute(req: DisputeRequest):
+    if get_transaction(req.tenant_id, req.transaction_id) is None:
+        raise HTTPException(status_code=404, detail="transaction not found")
+
+    thread_id = f"dispute-{req.tenant_id}-{req.transaction_id}"
+    config = make_config(thread_id)
+    result = app_graph.invoke({
+        "customer_message": req.customer_message,
+        "tenant_id": req.tenant_id,
+        "transaction_id": req.transaction_id,
+        "evidence": None,
+        "fraud_flag": None,
+        "draft": None,
+        "critic_verdict": None,
+        "approved": None,
+        "submitted": None,
+        "policy_context": None,
+    }, config=config)
+
+    if "__interrupt__" in result:
+        payload = result["__interrupt__"][0].value
+        return {
+            "status": "awaiting_approval",
+            "thread_id": thread_id,
+            "draft_text": payload["draft_text"],
+            "critic_notes": payload["critic_notes"],
+        }
+
+    return {
+        "status": "submitted" if result["submitted"] else "rejected",
+        "thread_id": thread_id,
+        "draft_text": result["draft"].draft_text,
+    }
+
+
+@app.post("/disputes/{thread_id}/approve")
+def approve_dispute_route(thread_id: str, req: ApprovalRequest):
+    config = make_config(thread_id)
+    result = app_graph.invoke(Command(resume={"approved": req.approved}), config=config)
+    return {
+        "status": "submitted" if result["submitted"] else "rejected",
+        "thread_id": thread_id,
+        "draft_text": result["draft"].draft_text,
+    }
+
 # graph2 = StateGraph(PolicyState)
 # graph2.add_node("retrieve_policy", retrieve_policy_node)
 # graph2.add_edge(START, "retrieve_policy")
@@ -532,7 +600,7 @@ app_graph = graph.compile(checkpointer=checkpointer)
 
 
 def run_dispute(customer_message: str, tenant_id: str, transaction_id: str, thread_id: str) -> dict:
-    config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+    config = make_config(thread_id)
     result = app_graph.invoke({
         "customer_message": customer_message,
         "tenant_id": tenant_id,
