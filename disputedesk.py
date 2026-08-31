@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Literal, TypedDict, Optional
 from langgraph.graph import StateGraph, END, START
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.postgres import PostgresSaver
 from langchain_core.runnables import RunnableConfig
 from langgraph.types import interrupt, Command
 from pydantic import BaseModel, ValidationError
@@ -13,6 +13,7 @@ from pgvector.psycopg2 import register_vector
 from anthropic_api_call import client
 from anthropic.types import Message, TextBlock
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
 import statistics
 import json
 import weaviate
@@ -41,15 +42,29 @@ app = FastAPI()
 
 embedder = SentenceTransformer("all-MiniLM-L6-v2")
 
-conn = psycopg2.connect(
-    host=os.environ.get("DB_HOST", "localhost"),
-    port=int(os.environ.get("DB_PORT", "5432")),
-    dbname=os.environ.get("DB_NAME", "postgres"),
-    user=os.environ.get("DB_USER", "postgres"),
-    password=os.environ.get("DB_PASSWORD", "devpassword"),
-)
+def build_db_uri() -> str:
+    if os.environ.get("DATABASE_URL"):
+        return os.environ["DATABASE_URL"]
+    return (
+        f"postgresql://{os.environ.get('DB_USER', 'postgres')}:"
+        f"{os.environ.get('DB_PASSWORD', 'devpassword')}@"
+        f"{os.environ.get('DB_HOST', 'localhost')}:"
+        f"{os.environ.get('DB_PORT', '5432')}/"
+        f"{os.environ.get('DB_NAME', 'postgres')}"
+    )
+
+DB_URI = build_db_uri()
+conn = psycopg2.connect(DB_URI)
+
 register_vector(conn)  # teaches psycopg2 how to send Python vectors to Postgres's vector column
 
+DB_URI = (
+    f"postgresql://{os.environ.get('DB_USER', 'postgres')}:"
+    f"{os.environ.get('DB_PASSWORD', 'devpassword')}@"
+    f"{os.environ.get('DB_HOST', 'localhost')}:"
+    f"{os.environ.get('DB_PORT', '5432')}/"
+    f"{os.environ.get('DB_NAME', 'postgres')}"
+)
 
 @dataclass
 class Transaction:
@@ -478,7 +493,11 @@ graph.add_edge("await_approval", "submit")
 graph.add_edge("submit", END)
 
 
-checkpointer = MemorySaver()
+_checkpointer_cm = PostgresSaver.from_conn_string(DB_URI)
+checkpointer = _checkpointer_cm.__enter__()  # entered manually, never exited — see atexit below
+checkpointer.setup()  # creates the checkpoint tables if they don't already exist
+atexit.register(lambda: _checkpointer_cm.__exit__(None, None, None))
+
 app_graph = graph.compile(checkpointer=checkpointer)
 
 
@@ -527,6 +546,11 @@ def submit_dispute(req: DisputeRequest):
         "draft_text": result["draft"].draft_text,
     }
 
+
+@app.get("/", response_class=HTMLResponse)
+def frontend():
+    with open("static/index.html") as f:
+        return f.read()
 
 @app.post("/disputes/{thread_id}/approve")
 def approve_dispute_route(thread_id: str, req: ApprovalRequest):
